@@ -41,6 +41,7 @@ PLATFORMS = {
     "iluvatar": "platform_cuda_iluvatar",
     "musa": "platform_musa",
     "tpu": "platform_tpu",
+    "neuron": "platform_neuron",
     "supa": "platform_supa",
 }
 ENGINES = {
@@ -112,11 +113,14 @@ def implementation_stubs(*, failures=(), real_profiler=False):
             "verl.workers.rollout.replica",
             "verl.utils",
             "verl.utils.device",
+            "verl.plugin",
+            "verl.plugin.platform",
         )
     )
     modules["verl.workers.rollout.replica"].RolloutReplicaRegistry = RolloutRegistry
     device = modules["verl.utils.device"]
     device.get_resource_name = mock.Mock(return_value="GPU")
+    modules["verl.plugin.platform"].get_platform = mock.Mock(return_value=SimpleNamespace(vendor_name="nvidia"))
     real_import = builtins.__import__
 
     def load_leaf(name):
@@ -124,6 +128,8 @@ def implementation_stubs(*, failures=(), real_profiler=False):
             return
         record(name)
         module = ModuleType(name)
+        if name.endswith(".platform_neuron"):
+            module.PlatformNeuron = type("PlatformNeuron", (), {})
         if name == profiler_name:
             module._patch_tool_config = lambda: record("profiler:config")
             module._patch_get_torch_profiler = lambda: record("profiler:torch")
@@ -244,6 +250,10 @@ def test_repeated_loading_uses_import_cache_without_rewrapping_rollout(plugin):
 
 
 def test_mlu_profiler_patches_remain_idempotent(plugin):
+    # Import torch before replacing verl's module tree: optional torch imports
+    # may otherwise discover the test's incomplete verl stand-ins.
+    import torch  # noqa: F401
+
     class ToolConfig:
         def __post_init__(self):
             self.original_contents = tuple(self.contents)

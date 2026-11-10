@@ -69,7 +69,7 @@ Create a backend directory under `verl_hardware_plugin/accelerators/`, then add 
 platform file, e.g. `verl_hardware_plugin/accelerators/my_vendor/platform_my_vendor.py`.
 Add an `__init__.py` to the backend package to register the platform as shown in
 Step 2. Use the same layout for domestic and international accelerators, such as
-Intel XPU, Google TPU, or future AWS Trainium.
+Intel XPU, Google TPU, or AWS Trainium.
 
 Below is a **fully annotated template** — every method includes comments explaining what it does and why:
 
@@ -925,7 +925,8 @@ verl-hardware-plugin/
 │   │   ├── musa/                         # Moore Threads MUSA
 │   │   ├── supa/                         # Biren SUPA
 │   │   ├── tpu/                          # Google TPU
-│   │   ├── trainium/                     # Reserved; no implementation or registration
+│   │   ├── neuron/                       # Native AWS Trainium integration
+│   │   ├── trainium/                     # Inert compatibility placeholder
 │   │   └── <backend>/                    # Each implemented backend owns these files
 │   │       ├── __init__.py               # Guarded platform registration only
 │   │       ├── registration.py           # Engine, profiler, and rollout registration

@@ -65,6 +65,36 @@ def test_contract_checks_attributes_used_through_module_aliases(tmp_path):
     ]
 
 
+def test_contract_does_not_require_attributes_installed_by_plugin(tmp_path):
+    plugin_root = tmp_path / "plugin"
+    verl_root = tmp_path / "upstream" / "verl"
+    _write(
+        plugin_root / "adapter.py",
+        "import verl.api as api\napi.plugin_hook = lambda: None\n",
+    )
+    _write(verl_root / "api.py", "")
+    requirements, missing = check_contract(plugin_root, verl_root)
+    assert [item.qualified_name for item in requirements] == ["verl.api"]
+    assert missing == []
+
+
+def test_contract_accepts_guarded_optional_hooks_but_checks_else_and_later_reads(tmp_path):
+    plugin_root = tmp_path / "plugin"
+    verl_root = tmp_path / "upstream" / "verl"
+    _write(
+        plugin_root / "adapter.py",
+        "import verl.api as api\n"
+        'if hasattr(api, "optional") and hasattr(api, "other"):\n'
+        "    api.optional(api.other)\n"
+        "else:\n"
+        "    api.required()\n"
+        "api.optional()\n",
+    )
+    _write(verl_root / "api.py", "")
+    _requirements, missing = check_contract(plugin_root, verl_root)
+    assert [item.requirement.qualified_name for item in missing] == ["verl.api.required", "verl.api.optional"]
+
+
 def test_contract_accepts_imported_submodules(tmp_path):
     plugin_root = tmp_path / "plugin"
     verl_root = tmp_path / "upstream" / "verl"

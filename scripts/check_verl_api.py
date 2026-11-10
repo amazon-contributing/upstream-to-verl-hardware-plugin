@@ -46,6 +46,42 @@ class ModuleSurface:
     star_exports: frozenset[str]
 
 
+def _guarded_attributes(test: ast.expr) -> set[tuple[str, str]]:
+    """Attributes guaranteed present by a positive hasattr/and condition."""
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        return set().union(*(_guarded_attributes(value) for value in test.values))
+    if (
+        isinstance(test, ast.Call)
+        and isinstance(test.func, ast.Name)
+        and test.func.id == "hasattr"
+        and len(test.args) == 2
+        and isinstance(test.args[0], ast.Name)
+        and isinstance(test.args[1], ast.Constant)
+        and isinstance(test.args[1].value, str)
+    ):
+        return {(test.args[0].id, test.args[1].value)}
+    return set()
+
+
+def _unguarded_module_reads(tree: ast.AST, guards: frozenset = frozenset()) -> Iterable[ast.Attribute]:
+    if isinstance(tree, ast.If):
+        yield from _unguarded_module_reads(tree.test, guards)
+        for statement in tree.body:
+            yield from _unguarded_module_reads(statement, guards | _guarded_attributes(tree.test))
+        for statement in tree.orelse:
+            yield from _unguarded_module_reads(statement, guards)
+        return
+    if (
+        isinstance(tree, ast.Attribute)
+        and isinstance(tree.ctx, ast.Load)
+        and isinstance(tree.value, ast.Name)
+        and (tree.value.id, tree.attr) not in guards
+    ):
+        yield tree
+    for child in ast.iter_child_nodes(tree):
+        yield from _unguarded_module_reads(child, guards)
+
+
 def collect_requirements(plugin_root: Path) -> list[Requirement]:
     """Collect every absolute verl import in the plugin package."""
 
@@ -65,11 +101,11 @@ def collect_requirements(plugin_root: Path) -> list[Requirement]:
                         requirements.add(Requirement(source, node.lineno, alias.name))
                         if alias.asname:
                             module_aliases[alias.asname] = alias.name
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-                module = module_aliases.get(node.value.id)
-                if module:
-                    requirements.add(Requirement(source, node.lineno, module, node.attr))
+        for node in _unguarded_module_reads(tree):
+            assert isinstance(node.value, ast.Name)
+            module = module_aliases.get(node.value.id)
+            if module:
+                requirements.add(Requirement(source, node.lineno, module, node.attr))
     return sorted(requirements, key=lambda item: (item.source, item.line, item.module, item.name or ""))
 
 
@@ -89,9 +125,9 @@ def _nested_module_statements(statements: Iterable[ast.stmt]) -> Iterable[ast.st
     for statement in statements:
         yield statement
         nested: list[list[ast.stmt]] = []
-        if isinstance(statement, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+        if isinstance(statement, ast.If | ast.For | ast.AsyncFor | ast.While):
             nested.extend([statement.body, statement.orelse])
-        elif isinstance(statement, (ast.With, ast.AsyncWith)):
+        elif isinstance(statement, ast.With | ast.AsyncWith):
             nested.append(statement.body)
         elif isinstance(statement, ast.Try):
             nested.extend([statement.body, statement.orelse, statement.finalbody])
@@ -123,7 +159,7 @@ def _resolve_import_from(current_module: str, module_path: Path, imported_module
 def _literal_string_collection(node: ast.expr) -> set[str] | None:
     """Evaluate a static collection of strings used for ``__all__``."""
 
-    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+    if isinstance(node, ast.List | ast.Tuple | ast.Set):
         values: set[str] = set()
         for element in node.elts:
             if not isinstance(element, ast.Constant) or not isinstance(element.value, str):
@@ -180,7 +216,7 @@ def _module_surface(
     star_imports: set[str] = set()
 
     for statement in _nested_module_statements(tree.body):
-        if isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(statement, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
             bindings.add(statement.name)
         elif isinstance(statement, ast.Import):
             for alias in statement.names:
@@ -194,9 +230,9 @@ def _module_surface(
                 else:
                     bindings.add(alias.asname or alias.name)
         elif isinstance(statement, ast.Assign):
-            for target in statement.targets:
-                if isinstance(target, ast.Name):
-                    bindings.add(target.id)
+            for assignment_target in statement.targets:
+                if isinstance(assignment_target, ast.Name):
+                    bindings.add(assignment_target.id)
         elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
             bindings.add(statement.target.id)
 

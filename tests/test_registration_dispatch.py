@@ -250,10 +250,6 @@ def test_repeated_loading_uses_import_cache_without_rewrapping_rollout(plugin):
 
 
 def test_mlu_profiler_patches_remain_idempotent(plugin):
-    # Import torch before replacing verl's module tree: optional torch imports
-    # may otherwise discover the test's incomplete verl stand-ins.
-    import torch  # noqa: F401
-
     class ToolConfig:
         def __post_init__(self):
             self.original_contents = tuple(self.contents)

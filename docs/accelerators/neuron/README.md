@@ -135,8 +135,7 @@ before gathering. `weight_sync_cpu_gather_threshold_bytes` defaults to zero; a
 positive value selects host gathering for large exports. Bucket size bounds
 transport buffers, not the largest gathered parameter.
 
-See [validation](validation.md) for commands and current results. This port derives
-from source plugin commit `7bf75e2`.
+This port derives from source plugin commit `7bf75e2`.
 [Historical public-stack results](https://github.com/czkkkkkk/upstream-verl-hardware-plugin/blob/7bf75e2/docs/accelerators/neuron/public_stack.md)
 used a development verl revision and completed only 26 of 56 steps. They are
 comparison evidence, not validation of this stable-release port.

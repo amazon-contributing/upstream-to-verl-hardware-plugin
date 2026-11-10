@@ -9,7 +9,8 @@ idle allocated cores and the documented host driver.
 ```bash
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0 VERL_PLATFORM=nvidia VLLM_PLUGINS=''
 export USE_TORCH_XLA=0 VERL_USE_EXTERNAL_PLUGINS=none OMP_NUM_THREADS=1
-"$VERL_NEURON_TRAIN_PYTHON" -m pytest -q tests
+"$VERL_NEURON_TRAIN_PYTHON" -m pytest -q \
+  tests/accelerators/neuron tests/test_registration_dispatch.py
 "$VERL_NEURON_ROLLOUT_PYTHON" -m pytest -q tests/accelerators/neuron
 RUN_NEURON_PUBLIC_RAY_TESTS=1 "$VERL_NEURON_ROLLOUT_PYTHON" -m pytest \
   tests/accelerators/neuron/test_public_runtime.py -k ray -sx
@@ -74,10 +75,10 @@ environments installed by `setup_neuron_public.sh`. Both contain the published
 
 | Check | Result |
 | --- | --- |
-| Full CPU suite, training interpreter | 666 passed, 30 skipped |
+| Neuron and registration tests, training interpreter | 164 passed, 28 skipped |
 | Neuron suite, serving interpreter | 137 passed, 7 skipped |
 | Ray serving-controller → training-worker batch exchange | 1 passed |
-| Static API check against the 0.9.1 release | 219 imports checked, 0 missing |
+| Neuron-only static API check against the 0.9.1 release | 26 imports checked, 0 missing |
 | Ruff lint and formatting | Passed |
 | Mypy with isolated CI tooling | Passed, 130 source files |
 | Pre-commit hooks on changed files | Passed |
@@ -86,8 +87,7 @@ environments installed by `setup_neuron_public.sh`. Both contain the published
 | Native trainer → lite receiver NIXL/LIBFABRIC | Passed: 10 writes, 41,943,188 bytes, suffix checks |
 | Qwen3-4B GRPO on 64 logical NeuronCores | Completed 56 steps, 57 policy synchronizations, 13 evaluations |
 
-The CPU suites were rerun after removing the workload recipes and their config
-test. The serving suite exercises the installed vLLM sampler. The launcher
+The serving suite exercises the installed vLLM sampler. The launcher
 regression verifies that vLLM discovery messages cannot enter Hydra arguments and
 that both interpreter paths and runtime environment settings survive config
 composition. Skipped tests include hardware-only and unavailable optional backend
@@ -95,6 +95,8 @@ cases. A mypy run inside the full SDK environment exposed eight existing XPU
 `pyzmq` attribute errors; the repository's isolated CI-style invocation passes.
 Running the pinned pre-commit hooks over the entire repository also reports
 existing MLU lint and TPU/test-stub typing issues outside this change.
+The unmodified repository-wide API checker reports nine entries in existing
+MLU/TPU code. The Neuron-only scan passes with that same checker.
 
 Local logs, the environment manifest, API report and wheel are retained in
 `/home/ubuntu/.cache/verl-neuron-stable-091/`. The managed worktree is

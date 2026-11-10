@@ -13,10 +13,6 @@ import time
 
 import pytest
 
-distributed = pytest.importorskip("torch.distributed")
-if not hasattr(distributed, "ProcessGroupXCCL"):
-    pytest.skip("needs a torch build with ProcessGroupXCCL", allow_module_level=True)
-
 engine = pytest.importorskip(
     "verl_hardware_plugin.accelerators.xpu.engines.xccl_checkpoint_engine",
     reason="needs a torch build with XPU and ProcessGroupXCCL",

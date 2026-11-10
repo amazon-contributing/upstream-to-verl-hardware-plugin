@@ -129,10 +129,9 @@ def test_native_logprobs_match_capped_distribution_and_preserve_tied_sample(top_
     assert metadata.top_k is None
 
 
-@pytest.mark.parametrize("topk", [0, 1])
-@pytest.mark.parametrize("greedy", [True, False])
-@pytest.mark.parametrize("num_requests,padded_rows", [(1, 1), (3, 4)])
-def test_native_logprobs_with_real_vllm_sampler(topk, greedy, num_requests, padded_rows):
+@pytest.fixture
+def sampling_runner():
+    """Share real vLLM sampling setup; tests supply only their runner hooks."""
     pytest.importorskip("vllm")
     device = os.environ.get("NEURON_TEST_SAMPLER_DEVICE", "cpu")
     if device != "cpu":
@@ -142,52 +141,61 @@ def test_native_logprobs_with_real_vllm_sampler(topk, greedy, num_requests, padd
     from vllm.v1.sample.metadata import SamplingMetadata
     from vllm.v1.sample.sampler import Sampler
 
-    metadata = SamplingMetadata(
-        temperature=None if greedy else torch.ones(num_requests).to(device),
-        all_greedy=greedy,
-        all_random=not greedy,
-        top_p=None,
-        top_k=None,
-        generators={},
+    def make_runner(num_requests, greedy, *, temperature=1.0, top_k=None, max_num_logprobs=0, **hooks):
+        metadata = SamplingMetadata(
+            temperature=None if greedy else torch.full((num_requests,), temperature, device=device),
+            all_greedy=greedy,
+            all_random=not greedy,
+            top_p=None,
+            top_k=None if top_k is None else torch.full((num_requests,), top_k, dtype=torch.int32, device=device),
+            generators={},
+            max_num_logprobs=max_num_logprobs,
+            no_penalties=True,
+            prompt_token_ids=None,
+            frequency_penalties=torch.zeros(num_requests),
+            presence_penalties=torch.zeros(num_requests),
+            repetition_penalties=torch.ones(num_requests),
+            output_token_ids=[],
+            allowed_token_ids_mask=None,
+            bad_words_token_ids={},
+            logitsprocs=LogitsProcessors(),
+        )
+        return SimpleNamespace(
+            device=device,
+            input_batch=SimpleNamespace(num_reqs=num_requests, sampling_metadata=metadata),
+            sampler=Sampler(logprobs_mode="processed_logprobs"),
+            **hooks,
+        )
+
+    return make_runner
+
+
+@pytest.mark.parametrize("topk", [0, 1])
+@pytest.mark.parametrize("greedy", [True, False])
+@pytest.mark.parametrize("num_requests,padded_rows", [(1, 1), (3, 4)])
+def test_native_logprobs_with_real_vllm_sampler(sampling_runner, topk, greedy, num_requests, padded_rows):
+    runner = sampling_runner(
+        num_requests,
+        greedy,
         max_num_logprobs=topk,
-        no_penalties=True,
-        prompt_token_ids=None,
-        frequency_penalties=torch.zeros(num_requests),
-        presence_penalties=torch.zeros(num_requests),
-        repetition_penalties=torch.ones(num_requests),
-        output_token_ids=[],
-        allowed_token_ids_mask=None,
-        bad_words_token_ids={},
-        logitsprocs=LogitsProcessors(),
-    )
-    runner = SimpleNamespace(
         neuron_config=SimpleNamespace(on_device_sampling_config=SimpleNamespace(max_top_k=256)),
         _lm_head_vocab_shard_size=lambda: 3,
-        _on_device_logits=torch.tensor([[3.0, 1.0, 20.0]]).repeat(padded_rows, 1).to(device),
-        input_batch=SimpleNamespace(num_reqs=num_requests, sampling_metadata=metadata),
-        sampler=Sampler(logprobs_mode="processed_logprobs"),
     )
+    runner._on_device_logits = torch.tensor([[3.0, 1.0, 20.0]]).repeat(padded_rows, 1).to(runner.device)
+    metadata = runner.input_batch.sampling_metadata
     output = native_sample_logprobs(runner, torch.ones(padded_rows, dtype=torch.long), 2, ())
     assert output.sampled_token_ids == [[1]] * num_requests
     assert output.logprobs_tensors.logprobs.shape[0] == num_requests
     assert output.logprobs_tensors.logprob_token_ids[0, 0] == 1
     torch.testing.assert_close(output.logprobs_tensors.logprobs[0, 0], torch.tensor([3.0, 1.0]).log_softmax(-1)[1])
     if metadata.temperature is not None:
-        assert str(metadata.temperature.device) == device
+        assert str(metadata.temperature.device) == runner.device
 
 
 @pytest.mark.parametrize("greedy", [True, False])
 @pytest.mark.parametrize("num_requests", range(1, 9))
-def test_cpu_sampling_scores_the_selected_token_and_preserves_batch(greedy, num_requests, monkeypatch):
-    pytest.importorskip("vllm")
-    device = os.environ.get("NEURON_TEST_SAMPLER_DEVICE", "cpu")
-    if device != "cpu":
-        importlib.import_module("libtorch_neuronx_lite")
-
-    from vllm.v1.sample.logits_processor import LogitsProcessors
-    from vllm.v1.sample.metadata import SamplingMetadata
+def test_cpu_sampling_scores_the_selected_token_and_preserves_batch(sampling_runner, greedy, num_requests, monkeypatch):
     from vllm.v1.sample.ops import topk_topp_sampler
-    from vllm.v1.sample.sampler import Sampler
 
     # Exercise the production dispatch hazard, independent of test-host Triton.
     def unexpected_triton(*args, **kwargs):
@@ -197,28 +205,12 @@ def test_cpu_sampling_scores_the_selected_token_and_preserves_batch(greedy, num_
     monkeypatch.setattr(topk_topp_sampler, "apply_top_k_top_p_triton", unexpected_triton, raising=False)
     vocab_size = 151936
     padded_rows = 1 << (num_requests - 1).bit_length()
-    metadata = SamplingMetadata(
-        temperature=None if greedy else torch.full((num_requests,), 0.5, device=device),
-        all_greedy=greedy,
-        all_random=not greedy,
-        top_p=None,
-        top_k=torch.full((num_requests,), 2, dtype=torch.int32, device=device),
-        generators={},
-        max_num_logprobs=0,
-        no_penalties=True,
-        prompt_token_ids=None,
-        frequency_penalties=torch.zeros(num_requests),
-        presence_penalties=torch.zeros(num_requests),
-        repetition_penalties=torch.ones(num_requests),
-        output_token_ids=[],
-        allowed_token_ids_mask=None,
-        bad_words_token_ids={},
-        logitsprocs=LogitsProcessors(),
-    )
-    runner = SimpleNamespace(
+    runner = sampling_runner(
+        num_requests,
+        greedy,
+        temperature=0.5,
+        top_k=2,
         neuron_config=SimpleNamespace(enable_structured_outputs=True, on_device_sampling_config=None),
-        sampler=Sampler(logprobs_mode="processed_logprobs"),
-        input_batch=SimpleNamespace(num_reqs=num_requests, sampling_metadata=metadata),
         use_async_scheduling=False,
         on_device_sampling=False,
         vocab_size=vocab_size,
@@ -229,6 +221,7 @@ def test_cpu_sampling_scores_the_selected_token_and_preserves_batch(greedy, num_
         ),
         _get_grammar_bitmask=lambda scheduler_output: None,
     )
+    device, metadata = runner.device, runner.input_batch.sampling_metadata
 
     def original_sample(model_output_tensor, spec_decode_metadata=None):
         return runner.sampler(model_output_tensor, runner.input_batch.sampling_metadata)

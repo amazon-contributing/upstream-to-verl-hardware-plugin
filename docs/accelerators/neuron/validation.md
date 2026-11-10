@@ -1,7 +1,7 @@
 # Neuron validation on verl 0.9.1
 
-Run commands from this checkout inside the pinned public container, with the
-two interpreter variables from the [guide](README.md). Hardware tests require
+Run commands from this checkout in the environment described in the
+[guide](README.md), with its two interpreter variables. Hardware tests require
 idle allocated cores and the documented host driver.
 
 ## CPU and cross-environment checks

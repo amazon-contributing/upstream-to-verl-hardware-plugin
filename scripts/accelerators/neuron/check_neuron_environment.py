@@ -74,7 +74,7 @@ def check(require_hardware=False):
         if report["python"] != [3, 12]:
             raise SystemExit(f"{role}: the public recipe requires Python 3.12")
         if report["libc"][0] != "glibc" or tuple(map(int, report["libc"][1].split("."))) < (2, 43):
-            raise SystemExit(f"{role}: public TorchNeuron requires GLIBC >= 2.43; use the Ubuntu 26.04 container")
+            raise SystemExit(f"{role}: public TorchNeuron requires GLIBC >= 2.43; use a compatible system environment")
         if report["forbidden"]:
             raise SystemExit(f"{role}: remove neuron-rl-core from the public environment")
         forbidden_runtime = "libtorch-neuronx-lite" if role == "training" else "torch-neuronx"
@@ -99,7 +99,7 @@ def check(require_hardware=False):
             if reports["system"][name] != version:
                 raise SystemExit(
                     f"Public RL requires {name}={version}, found {reports['system'][name]}. "
-                    "Use the pinned container and matching host driver."
+                    "Use the documented runtime versions and matching host driver."
                 )
     print(json.dumps(reports, indent=2))
 

@@ -44,46 +44,29 @@ Controllers and reward workers use the serving interpreter without importing
 TorchNeuron. A packaged shell launcher selects the interpreter before Python
 starts and preserves Ray's assigned NeuronCores.
 
-The [container](../../../docker/Dockerfile.neuron-public) supplies Ubuntu 26.04
+The validated system environment uses Ubuntu 26.04
 (the pinned TorchNeuron binary needs GLIBC 2.43), Neuron runtime
 `2.35.30.0-d2725ccb8`, collectives `2.35.43.0-354ad3064`, and EFA userspace
 libfabric `2.7.0amzn2.0`. The host must supply Neuron driver **2.31.7.0** and EFA
 kernel support. Setup does not install or reload host drivers.
-NIXL uses CUDA 12 libraries/stubs even for Neuron HBM; do not install `nixl-cu13`
-or replace the container's EFA libraries with older host libraries.
+NIXL uses CUDA 12 libraries/stubs even for Neuron HBM, including `libcuda.so.1`.
+Install `libnuma-dev` for the unversioned `libnuma.so` needed by TorchNeuron.
+Use the documented EFA libraries and `nixl-cu12`.
 
 ## Installation and launch
 
-Build from the plugin checkout:
+Run from the plugin checkout on an idle Trainium2 host, using an environment
+with the system dependencies above, Git, and uv 0.11.14. The process must have
+access to the Neuron and EFA devices, model files, and datasets.
+Set `PUBLIC_ENVS` to an absolute writable directory:
 
 ```bash
-docker build -f docker/Dockerfile.neuron-public -t verl-neuron-public:2.33 .
-```
-
-Run on an idle Trainium2 host. Set absolute `PUBLIC_ENVS`, `MODEL_DIR` and
-`DATA_DIR` paths before this command:
-
-```bash
-mkdir -p "$PUBLIC_ENVS"
-neuron_devices=()
-for device in /dev/neuron[0-9]*; do neuron_devices+=(--device "$device"); done
-docker run --rm -it --network host --ipc host --ulimit memlock=-1:-1 \
-  "${neuron_devices[@]}" --device /dev/infiniband \
-  -v "$PWD:$PWD" -w "$PWD" \
-  -v "$PUBLIC_ENVS:$PUBLIC_ENVS" \
-  -v "$MODEL_DIR:$MODEL_DIR:ro" -v "$DATA_DIR:$DATA_DIR:ro" \
-  -e PUBLIC_ENVS="$PUBLIC_ENVS" \
-  -e UV_PYTHON_INSTALL_DIR="$PUBLIC_ENVS/python" \
-  -e UV_CACHE_DIR="$PUBLIC_ENVS/uv-cache" \
-  -e HF_HOME="$PUBLIC_ENVS/hf-cache" \
-  -e VLLM_CACHE_ROOT="$PUBLIC_ENVS/vllm-cache" \
-  -e NKI_COMPILE_CACHE_URL="$PUBLIC_ENVS/nki-cache" \
-  verl-neuron-public:2.33 bash
-```
-
-Inside the container:
-
-```bash
+export PUBLIC_ENVS=/absolute/path/to/neuron-envs
+export UV_CACHE_DIR="$PUBLIC_ENVS/uv-cache"
+export HF_HOME="$PUBLIC_ENVS/hf-cache"
+export VLLM_CACHE_ROOT="$PUBLIC_ENVS/vllm-cache"
+export NKI_COMPILE_CACHE_URL="$PUBLIC_ENVS/nki-cache"
+export LD_LIBRARY_PATH="/opt/aws/neuron/lib:/opt/amazon/efa/lib:/opt/amazon/efa/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 bash scripts/accelerators/neuron/setup_neuron_public.sh "$PUBLIC_ENVS"
 export VERL_NEURON_TRAIN_PYTHON="$PUBLIC_ENVS/training/bin/python"
 export VERL_NEURON_ROLLOUT_PYTHON="$PUBLIC_ENVS/serving/bin/python"
@@ -95,7 +78,7 @@ CONFIG_PATH=/absolute/path/to/your/configs CONFIG_NAME=your_training_config \
 ```
 
 The launcher accepts an external Hydra configuration and additional overrides;
-workload examples and dataset recipes are not bundled. Use the mounted model and
+workload examples and dataset recipes are not bundled. Use your model and
 data paths in your configuration. Compose verl's `ppo_trainer` with
 `model_engine: torchtitan` and `pkg://verl.trainer.config` in Hydra's search path.
 Apply the following backend settings:

@@ -136,13 +136,6 @@ reward function reproduced every saved score and logged accuracy.
 | 55 | 1,230 | 93.25% |
 | 56 | 1,226 | 92.95% |
 
-![Completed stable-release learning curve and partial source run](gsm8k_qwen3_4b_verl_0_9_1.svg)
-
-[Evaluation CSV](gsm8k_qwen3_4b_verl_0_9_1.csv). The historical series contains
-rounded values from source commit `7bf75e2`, which used development verl and
-stopped during step 27. It provides context without asserting numerical or
-performance equivalence.
-
 All recorded scalars were finite. Every training step had positive gradients
 (norm range 0.09045–0.18510). All 57 policy synchronizations, including
 initialization, delivered their final bucket to all 32 rollout workers.

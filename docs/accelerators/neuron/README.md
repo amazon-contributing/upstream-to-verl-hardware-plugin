@@ -3,7 +3,7 @@
 This experimental backend runs single-host GRPO with native Neuron TorchTitan
 training and vLLM-Neuron rollout using the published **verl 0.9.1** release.
 The plugin owns platform integration, dense HF-to-TP weight layouts, and direct
-NIXL/LIBFABRIC transport. It does not depend on `neuron-rl-core`.
+NIXL/LIBFABRIC transport.
 
 ## Supported configuration
 

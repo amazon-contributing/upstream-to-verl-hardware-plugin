@@ -49,10 +49,6 @@ Keep using the same shell for the example below.
 ```bash
 export PLUGIN_DIR="$PWD"
 export PUBLIC_ENVS=/absolute/path/to/neuron-envs
-export UV_CACHE_DIR="$PUBLIC_ENVS/uv-cache"
-export HF_HOME="$PUBLIC_ENVS/hf-cache"
-export VLLM_CACHE_ROOT="$PUBLIC_ENVS/vllm-cache"
-export NKI_COMPILE_CACHE_URL="$PUBLIC_ENVS/nki-cache"
 export LD_LIBRARY_PATH="/opt/aws/neuron/lib:/opt/amazon/efa/lib:/opt/amazon/efa/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 bash "$PLUGIN_DIR/scripts/accelerators/neuron/setup_neuron_public.sh" "$PUBLIC_ENVS"
@@ -66,6 +62,11 @@ export VERL_NEURON_ROLLOUT_PYTHON="$PUBLIC_ENVS/serving/bin/python"
 Resolve any environment-check failures before launching training. There is no
 need to activate either environment: the launcher selects the appropriate
 interpreter for each worker.
+
+The example uses the default uv, Hugging Face, and vLLM cache locations.
+The launcher defaults `NKI_COMPILE_CACHE_URL` to `$PUBLIC_ENVS/nki-cache`.
+Set `UV_CACHE_DIR`, `HF_HOME`, `VLLM_CACHE_ROOT`, or `NKI_COMPILE_CACHE_URL` only
+if you need a different cache location.
 
 ## 2. Run a minimal GRPO example
 

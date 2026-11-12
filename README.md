@@ -95,9 +95,7 @@ engine imports cache the selected device. Directly importing a backend's
 `registration.py` also initializes its package and registers its platform.
 Independent optional imports are guarded locally; there is no shared stage
 framework or separate component registry list. Integration package initializers
-remain inert because they do not register platforms. Explicit `VERL_PLATFORM=aws`
-loads only Neuron and reports initialization failures, keeping incompatible vendor
-runtimes out of native training/serving processes.
+remain inert because they do not register platforms.
 
 ### Plugin Registration
 

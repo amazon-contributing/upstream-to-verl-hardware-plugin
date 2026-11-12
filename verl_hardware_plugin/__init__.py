@@ -33,22 +33,16 @@ BACKEND_MODULES = (
 
 def load_backends() -> None:
     """Import each backend's self-contained registration entry point."""
-    selected_neuron = os.environ.get("VERL_PLATFORM") == "aws"
-    modules = ("verl_hardware_plugin.accelerators.neuron",) if selected_neuron else BACKEND_MODULES
     # Upstream engines cache get_platform() during import, so register platforms first.
-    for module_name in modules:
+    for module_name in BACKEND_MODULES:
         try:
             importlib.import_module(module_name)
         except Exception as exc:
-            if selected_neuron:
-                raise RuntimeError("Failed to initialize the selected Trainium platform") from exc
             logger.debug("Failed to load backend %s: %s", module_name, exc)
-    for module_name in modules:
+    for module_name in BACKEND_MODULES:
         try:
             importlib.import_module(f"{module_name}.registration")
         except Exception as exc:
-            if selected_neuron:
-                raise RuntimeError("Failed to register the selected Trainium engines") from exc
             logger.debug("Failed to register backend %s: %s", module_name, exc)
 
 

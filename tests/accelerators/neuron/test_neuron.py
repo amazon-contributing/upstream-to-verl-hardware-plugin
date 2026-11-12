@@ -123,31 +123,6 @@ def test_only_cuda_checkpoint_import_is_blocked(monkeypatch):
         assert finders[0].find_spec(module) is None
 
 
-def test_explicit_trainium_does_not_import_other_vendor_runtimes(monkeypatch):
-    import verl_hardware_plugin
-
-    loaded = []
-    monkeypatch.setenv("VERL_PLATFORM", "aws")
-    monkeypatch.setattr(verl_hardware_plugin.importlib, "import_module", loaded.append)
-    verl_hardware_plugin.load_backends()
-    assert loaded == [
-        "verl_hardware_plugin.accelerators.neuron",
-        "verl_hardware_plugin.accelerators.neuron.registration",
-    ]
-
-
-def test_selected_trainium_import_failure_is_not_silenced(monkeypatch):
-    import verl_hardware_plugin
-
-    def unavailable(module):
-        raise ImportError("missing native runtime")
-
-    monkeypatch.setenv("VERL_PLATFORM", "aws")
-    monkeypatch.setattr(verl_hardware_plugin.importlib, "import_module", unavailable)
-    with pytest.raises(RuntimeError, match="selected Trainium"):
-        verl_hardware_plugin.load_backends()
-
-
 @pytest.mark.parametrize(
     "overrides",
     [

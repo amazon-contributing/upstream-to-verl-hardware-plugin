@@ -85,7 +85,7 @@ User guides mirror this layout under `docs/accelerators/<backend>/` and
 `docs/integrations/flagos/`. Accelerator-specific tests and scripts live under
 `tests/accelerators/<backend>/` and `scripts/accelerators/<backend>/`; shared tests
 and scripts stay at their existing top level. AWS Trainium support lives under
-`neuron`; the legacy `trainium` directories remain placeholders.
+`neuron`.
 
 Add each backend package once to `BACKEND_MODULES` in the plugin's root
 `__init__.py`. `load_backends()` first imports these packages to register their

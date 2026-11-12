@@ -66,7 +66,7 @@ class NeuronNixlCheckpointEngine(CheckpointEngine):
         if self.rank == 0:
             if not hasattr(self, "port"):
                 with socket.socket() as listener:
-                    listener.bind(("", 0))
+                    listener.bind(("127.0.0.1", 0))
                     self.port = listener.getsockname()[1]
             metadata.update(host=ray.util.get_node_ip_address(), port=self.port, timeout_s=self.timeout_s)
         return metadata

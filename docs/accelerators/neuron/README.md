@@ -36,10 +36,13 @@ rollout `vllm`, and checkpoint backend `neuron_nixl`. Actor/reference configs us
 | Serving PyTorch / lite | `2.13.0+cpu` / `2.13.0.1.0.3112+653bc48f` |
 | vLLM / Ray / TransferQueue | `0.29.0` / `2.55.0` / `0.1.11` |
 
-Both environments use managed Python 3.12.13. Complete pins are in
-[training requirements](../../../requirements/neuron-training.txt) and
-[serving requirements](../../../requirements/neuron-serving.txt).
-Installation uses `--no-deps` to preserve CPU PyTorch wheels.
+Both environments use managed Python 3.12.13. This repository does not bundle
+dependency snapshots. Supply separate, complete training and serving requirements
+files to the setup script, including transitive dependencies: installation uses
+`--no-deps` to preserve CPU PyTorch wheels. The files must match the versions above
+and those enforced by
+[the environment checker](../../../scripts/accelerators/neuron/check_neuron_environment.py).
+The script installs TorchTitan Neuron, vLLM-Neuron, and this plugin separately.
 Controllers and reward workers use the serving interpreter without importing
 TorchNeuron. A packaged shell launcher selects the interpreter before Python
 starts and preserves Ray's assigned NeuronCores.
@@ -58,10 +61,13 @@ Use the documented EFA libraries and `nixl-cu12`.
 Run from the plugin checkout on an idle Trainium2 host, using an environment
 with the system dependencies above, Git, and uv 0.11.14. The process must have
 access to the Neuron and EFA devices, model files, and datasets.
-Set `PUBLIC_ENVS` to an absolute writable directory:
+Set `PUBLIC_ENVS` to an absolute writable directory and provide the paths to your
+training and serving requirements files:
 
 ```bash
 export PUBLIC_ENVS=/absolute/path/to/neuron-envs
+export NEURON_TRAINING_REQUIREMENTS=/absolute/path/to/training-requirements.txt
+export NEURON_SERVING_REQUIREMENTS=/absolute/path/to/serving-requirements.txt
 export UV_CACHE_DIR="$PUBLIC_ENVS/uv-cache"
 export HF_HOME="$PUBLIC_ENVS/hf-cache"
 export VLLM_CACHE_ROOT="$PUBLIC_ENVS/vllm-cache"

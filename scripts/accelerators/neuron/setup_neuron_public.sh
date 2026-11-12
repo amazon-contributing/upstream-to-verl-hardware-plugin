@@ -6,6 +6,13 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 environment_root=${1:?Usage: setup_neuron_public.sh /absolute/environment/root}
 [[ "$environment_root" == /* ]] || { echo "Use an absolute environment root." >&2; exit 1; }
+: "${NEURON_TRAINING_REQUIREMENTS:?Set the absolute path to your training requirements file}"
+: "${NEURON_SERVING_REQUIREMENTS:?Set the absolute path to your serving requirements file}"
+for requirements_file in "$NEURON_TRAINING_REQUIREMENTS" "$NEURON_SERVING_REQUIREMENTS"; do
+    [[ "$requirements_file" == /* && -f "$requirements_file" && -r "$requirements_file" ]] || {
+        echo "Requirements must be an existing readable absolute file: $requirements_file" >&2; exit 1;
+    }
+done
 uv_bin=${UV_BIN:-uv}
 export UV_PYTHON_INSTALL_DIR=${UV_PYTHON_INSTALL_DIR:-"$environment_root/python"}
 export UV_PYTHON_BIN_DIR=${UV_PYTHON_BIN_DIR:-"$environment_root/bin"}
@@ -35,12 +42,14 @@ for role in training serving; do
     if [[ ! -x "$environment/bin/python" ]]; then
         "$uv_bin" venv --python "$python_bin" "$environment"
     fi
-    # The Neuron backend does not use vLLM's CUDA/audio extras. Install the tested
-    # package set without resolving those extras over the pinned CPU PyTorch.
+    requirements_file=$NEURON_TRAINING_REQUIREMENTS
+    [[ "$role" == serving ]] && requirements_file=$NEURON_SERVING_REQUIREMENTS
+    # Use complete, externally maintained requirements without resolving
+    # CUDA/audio extras over the pinned CPU PyTorch.
     "$uv_bin" pip install --python "$environment/bin/python" --no-deps \
         --extra-index-url https://pip.repos.neuron.amazonaws.com \
         --extra-index-url https://download.pytorch.org/whl/cpu \
-        --index-strategy unsafe-best-match -r "$ROOT/requirements/neuron-$role.txt"
+        --index-strategy unsafe-best-match -r "$requirements_file"
     source_name=torchtitan-neuron
     [[ "$role" == serving ]] && source_name=vllm-neuron
     "$uv_bin" pip install --python "$environment/bin/python" --no-deps --no-build-isolation \

@@ -1,146 +1,258 @@
-# AWS Trainium: TorchTitan and vLLM-Neuron
+# Run verl on AWS Trainium
 
-This experimental backend runs single-host GRPO with native Neuron TorchTitan
-training and vLLM-Neuron rollout using the published **verl 0.9.1** release.
-The plugin owns platform integration, dense HF-to-TP weight layouts, and direct
-NIXL/LIBFABRIC transport.
+This experimental backend runs **verl 0.9.1** with native Neuron TorchTitan
+training and vLLM-Neuron rollout. This guide covers environment setup and a small
+GRPO example using Qwen3-0.6B and GSM8K on one Trainium2 host.
 
-## Supported configuration
+## 1. Set up the environment
 
-- Dense Qwen3, BF16, actor and frozen reference, rule-based GRPO rewards.
-- FSDP2 × tensor parallel training and independent TP-only rollout replicas.
-- Fixed-width, right-padded causal SDPA inputs with sequence lengths divisible
-  by 512. Differentiable token statistics move to the host for verl's loss;
-  model execution and optimization stay on Trainium.
-- Vocabulary-parallel log probabilities delegate to TorchTitan's unreduced loss.
-  Entropy supports gradients without gathering vocabulary logits.
-- Synchronous model/optimizer/scheduler checkpoints on a shared filesystem.
+### Prepare the host
 
-Training attention heads, KV heads, vocabulary and FFN width must divide by TP.
-CP, EP and PP must be one. Packed inputs, model/optimizer offloading, MoE,
-quantization, learned critics, multimodal inputs, colocated rollout and multi-node
-jobs are outside the supported configuration.
+Use an idle Trainium2 host with access to its Neuron and EFA devices. The
+validated system environment is:
 
-Registry keys are `VERL_PLATFORM=aws`, device `neuron`, strategy `torchtitan`,
-rollout `vllm`, and checkpoint backend `neuron_nixl`. Actor/reference configs use
-`verl_hardware_plugin.accelerators.neuron.engines.config.NeuronTorchtitanEngineConfig`.
-
-## Public dependency pins
-
-| Component | Release / revision |
+| Component | Version / requirement |
 | --- | --- |
-| verl | PyPI `0.9.1`; release commit `1876b06d0a3e4e71e06230be10af14492ca8a75b` |
-| TorchTitan Neuron | `release-2.33.0`, `b7582e986586051d7be85d03956afe169624aeda` |
-| vLLM-Neuron | `v0.29.0.1.2.0`, `eb6cb360f7cff6082e22a9437d8ce0ba3891304a` |
-| Training PyTorch / TorchNeuron | `2.14.0+cpu` / `2.14.3.0.281+dc70ffa` |
-| Serving PyTorch / lite | `2.13.0+cpu` / `2.13.0.1.0.3112+653bc48f` |
-| vLLM / Ray / TransferQueue | `0.29.0` / `2.55.0` / `0.1.11` |
+| OS | Ubuntu 26.04; the pinned TorchNeuron binary requires GLIBC 2.43 |
+| Neuron driver | `2.31.7.0` |
+| Neuron runtime | `2.35.30.0-d2725ccb8` |
+| Neuron collectives | `2.35.43.0-354ad3064` |
+| EFA userspace libfabric | `2.7.0amzn2.0`, with EFA kernel support |
+| System libraries | `libnuma-dev` for `libnuma.so`; CUDA 12 libraries/stubs, including `libcuda.so.1`, for NIXL |
+| Setup tools | Git, curl, and [uv](https://docs.astral.sh/uv/getting-started/installation/) `0.11.14` |
 
-Both environments use managed Python 3.12.13. The
-[setup script](../../../scripts/accelerators/neuron/setup_neuron_public.sh) pins the
-runtime packages and source revisions, then uses uv to resolve their transitive
-dependencies. It selects CPU PyTorch wheels and excludes unused CUDA kernels,
-audio/video packages, and `nixl-cu13` from upstream dependency metadata. All other
-dependencies, including those of the editable source packages, are resolved normally.
-No external requirements files are needed. Transitive versions may vary between
-installs; the environment checker verifies the required runtime versions.
-Generic dependency checks can report the intentionally excluded packages as missing.
-Controllers and reward workers use the serving interpreter without importing
-TorchNeuron. A packaged shell launcher selects the interpreter before Python
-starts and preserves Ray's assigned NeuronCores.
+Provision these system dependencies before running the installer. The installer
+creates Python environments; it does not install host drivers, EFA, or system
+libraries.
 
-The validated system environment uses Ubuntu 26.04
-(the pinned TorchNeuron binary needs GLIBC 2.43), Neuron runtime
-`2.35.30.0-d2725ccb8`, collectives `2.35.43.0-354ad3064`, and EFA userspace
-libfabric `2.7.0amzn2.0`. The host must supply Neuron driver **2.31.7.0** and EFA
-kernel support. Setup does not install or reload host drivers.
-NIXL uses CUDA 12 libraries/stubs even for Neuron HBM, including `libcuda.so.1`.
-Install `libnuma-dev` for the unversioned `libnuma.so` needed by TorchNeuron.
-Use the documented EFA libraries and `nixl-cu12`.
+### Install the Python dependencies
 
-## Installation and launch
+Training and serving require different PyTorch and TorchNeuron versions, so the
+[installer](../../../scripts/accelerators/neuron/setup_neuron_public.sh) creates
+two environments:
 
-Run from the plugin checkout on an idle Trainium2 host, using an environment
-with the system dependencies above, Git, and uv 0.11.14. The process must have
-access to the Neuron and EFA devices, model files, and datasets.
-Set `PUBLIC_ENVS` to an absolute writable directory:
+| Environment | Purpose | Main dependencies |
+| --- | --- | --- |
+| `training` | Actor and frozen reference | PyTorch `2.14.0+cpu`, TorchNeuron `2.14.3.0.281+dc70ffa`, TorchTitan Neuron `release-2.33.0` |
+| `serving` | Rollout, controller, and reward workers | PyTorch `2.13.0+cpu`, lite `2.13.0.1.0.3112+653bc48f`, vLLM `0.29.0`, vLLM-Neuron `v0.29.0.1.2.0` |
+
+Both use managed Python 3.12.13, verl 0.9.1, and this plugin installed in editable
+mode. The installer pins the required runtime packages and source revisions,
+then uses uv to resolve transitive dependencies. No external requirements files
+are needed. It excludes unused CUDA kernels, audio/video packages, and
+`nixl-cu13`; generic dependency checks may report these intentional exclusions.
+
+Run the following from the plugin checkout. Set `PUBLIC_ENVS` to an absolute,
+writable path with room for both environments, model weights, and compiler caches.
+Keep using the same shell for the example below.
 
 ```bash
+export PLUGIN_DIR="$PWD"
 export PUBLIC_ENVS=/absolute/path/to/neuron-envs
 export UV_CACHE_DIR="$PUBLIC_ENVS/uv-cache"
 export HF_HOME="$PUBLIC_ENVS/hf-cache"
 export VLLM_CACHE_ROOT="$PUBLIC_ENVS/vllm-cache"
 export NKI_COMPILE_CACHE_URL="$PUBLIC_ENVS/nki-cache"
 export LD_LIBRARY_PATH="/opt/aws/neuron/lib:/opt/amazon/efa/lib:/opt/amazon/efa/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-bash scripts/accelerators/neuron/setup_neuron_public.sh "$PUBLIC_ENVS"
+
+bash "$PLUGIN_DIR/scripts/accelerators/neuron/setup_neuron_public.sh" "$PUBLIC_ENVS"
+
 export VERL_NEURON_TRAIN_PYTHON="$PUBLIC_ENVS/training/bin/python"
 export VERL_NEURON_ROLLOUT_PYTHON="$PUBLIC_ENVS/serving/bin/python"
-"$VERL_NEURON_ROLLOUT_PYTHON" scripts/accelerators/neuron/check_neuron_environment.py --hardware
-
-CONFIG_PATH=/absolute/path/to/your/configs CONFIG_NAME=your_training_config \
-  RUN_DIR=/runs/neuron \
-  bash scripts/accelerators/neuron/run_neuron.sh
+"$VERL_NEURON_ROLLOUT_PYTHON" \
+  "$PLUGIN_DIR/scripts/accelerators/neuron/check_neuron_environment.py" --hardware
 ```
 
-The launcher accepts an external Hydra configuration and additional overrides;
-workload examples and dataset recipes are not bundled. Use your model and
-data paths in your configuration. Compose verl's `ppo_trainer` with
-`model_engine: torchtitan` and `pkg://verl.trainer.config` in Hydra's search path.
-Apply the following backend settings:
+Resolve any environment-check failures before launching training. There is no
+need to activate either environment: the launcher selects the appropriate
+interpreter for each worker.
 
-| Configuration | Required value |
-| --- | --- |
-| `trainer.device`, `trainer.use_v1` | `neuron`, `true` |
-| `trainer.v1.trainer_mode`, `actor_rollout_ref.hybrid_engine` | `separate_async`, `false` |
-| Actor/reference `torchtitan._target_` | `verl_hardware_plugin.accelerators.neuron.engines.config.NeuronTorchtitanEngineConfig` |
-| Actor/reference `torchtitan.attn_type`, `spmd_backend` | `sdpa`, `default` |
-| Model and actor/reference `torchtitan.use_remove_padding` | `false` |
-| Model `use_fused_kernels` | `false` |
-| Actor `use_dynamic_bsz`; reference/rollout `log_prob_use_dynamic_bsz` | `false` |
-| Rollout `name`, `dtype`, `load_format` | `vllm`, `bfloat16`, `auto` |
-| Rollout `enable_sleep_mode`, `free_cache_engine`, `enable_prefix_caching`, `enable_chunked_prefill` | `false` |
-| Rollout `calculate_log_probs` | `true` |
-| Rollout `checkpoint_engine.backend` | `neuron_nixl` |
-| Rollout `checkpoint_engine.custom_backend_module` | `verl_hardware_plugin.accelerators.neuron.weight_sync.checkpoint_engine` |
+## 2. Run a minimal GRPO example
 
-Set actor/reference `torchtitan.max_seq_len` to the prompt plus response length,
-divisible by 512, and set rollout length/token limits accordingly. Disable model
-and optimizer offloading. Set fixed micro-batch sizes and parallel dimensions for
-your allocation. `trainer.n_gpus_per_node` counts training NeuronCores; rollout
-`n_gpus_per_node` counts separate rollout NeuronCores. Both use one node.
+This example uses **four logical NeuronCores**: two for the actor and frozen
+reference, and two for one rollout replica. Both use tensor parallelism of two.
+On Trainium2, the launcher defaults to `NEURON_LOGICAL_NC_CONFIG=2`.
+The verl fields named `n_gpus_per_node` count NeuronCores in this backend.
 
-The launcher refuses an existing Ray cluster or occupied NeuronCores. Cold native
-compilation can take more than 15 minutes. Preserve NKI
-binaries together with the vLLM cache: compiled graphs contain absolute kernel paths.
+The run uses four prompts per step, two responses per prompt, and two training
+steps. It is a smoke run for setup, generation, training, and weight
+synchronization; it is too short to assess model quality.
 
-## Stable verl compatibility and synchronization
+### Prepare the model and dataset
 
-The plugin adapts 0.9.1 without editing the installed release. Ray checks count
-`neuron_cores` and allocations remain exclusive. The launcher explicitly forwards
-runtime settings because 0.9.1 does not consume the platform's Ray hook.
-The Neuron server returns collective-RPC acknowledgements, validates effective
-sampling settings, and checks sampled-token log probabilities. A trainer-local
-logging adapter handles the release's `flush=True` log call.
+Download Qwen3-0.6B and use the GSM8K preprocessing script from the pinned verl
+release. The script creates the prompt and answer fields used by verl's built-in
+GSM8K reward function.
 
-Native sampling supports temperature, top-k and top-p. Scoring follows the
-device-selected token and native sampler's candidate cap (normally 256) and
-top-p convention. Unsupported penalties, seeded sampling, custom processors,
-speculative decoding and jump-forward decoding fail explicitly. Optional CPU
-sampling keeps metadata on the host and avoids CUDA/Triton dispatch.
+```bash
+export NEURON_EXAMPLE_DIR="$PUBLIC_ENVS/examples/gsm8k"
+export MODEL_DIR="$NEURON_EXAMPLE_DIR/Qwen3-0.6B"
+export DATA_DIR="$NEURON_EXAMPLE_DIR/data"
+export CONFIG_PATH="$NEURON_EXAMPLE_DIR/config"
+mkdir -p "$DATA_DIR" "$CONFIG_PATH"
 
-All trainer ranks export deterministic HF tensors. Senders distribute receiver
-TP layouts round-robin and transfer packed BF16 payloads over NIXL. TCPStore
-carries metadata and acknowledgements only. Receivers validate full weight
-coverage and apply each bucket before acknowledging slot reuse. Failed updates
-keep generation paused and do not advance the policy version.
+# Use the serving environment for data preparation and the controller.
+export VERL_PLATFORM=aws
+export VERL_NEURON_PROCESS_ROLE=controller
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+export VLLM_PLUGINS=""
+export LD_LIBRARY_PATH="$PUBLIC_ENVS/serving/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-The lite receiver stages buckets through host memory when installing weights.
-Transport remains HBM-to-HBM NIXL/LIBFABRIC. Export casts local shards to BF16
-before gathering. `weight_sync_cpu_gather_threshold_bytes` defaults to zero; a
-positive value selects host gathering for large exports. Bucket size bounds
-transport buffers, not the largest gathered parameter.
+"$PUBLIC_ENVS/serving/bin/hf" download Qwen/Qwen3-0.6B --local-dir "$MODEL_DIR"
+curl -fsSL \
+  https://raw.githubusercontent.com/verl-project/verl/1876b06d0a3e4e71e06230be10af14492ca8a75b/examples/data_preprocess/gsm8k.py \
+  -o "$NEURON_EXAMPLE_DIR/prepare_gsm8k.py"
+"$VERL_NEURON_ROLLOUT_PYTHON" "$NEURON_EXAMPLE_DIR/prepare_gsm8k.py" \
+  --local_save_dir "$DATA_DIR"
+```
 
-This port derives from source plugin commit `7bf75e2`.
-[Historical public-stack results](https://github.com/czkkkkkk/upstream-verl-hardware-plugin/blob/7bf75e2/docs/accelerators/neuron/public_stack.md)
-used a development verl revision and completed only 26 of 56 steps. They are
-comparison evidence, not validation of this stable-release port.
+### Create the training configuration
+
+This configuration extends verl's `ppo_trainer` defaults. The actor and reference
+share the Neuron engine settings through a YAML anchor.
+
+```bash
+cat > "$CONFIG_PATH/neuron_gsm8k.yaml" <<'YAML'
+defaults:
+  - ppo_trainer
+  - override model_engine: torchtitan
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+data:
+  train_files: ${oc.env:DATA_DIR}/train.parquet
+  val_files: ${oc.env:DATA_DIR}/test.parquet
+  train_max_samples: 32
+  val_max_samples: 8
+  train_batch_size: 4
+  max_prompt_length: 512
+  max_response_length: 512
+  filter_overlong_prompts: true
+  dataloader_num_workers: 0
+  apply_chat_template_kwargs:
+    enable_thinking: false
+
+algorithm:
+  adv_estimator: grpo
+
+actor_rollout_ref:
+  hybrid_engine: false
+  model:
+    path: ${oc.env:MODEL_DIR}
+    use_remove_padding: false
+    use_fused_kernels: false
+  actor:
+    ppo_mini_batch_size: 4
+    ppo_micro_batch_size_per_gpu: 1
+    use_dynamic_bsz: false
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    optim:
+      lr: 1.0e-6
+    torchtitan: &neuron_engine
+      _target_: verl_hardware_plugin.accelerators.neuron.engines.config.NeuronTorchtitanEngineConfig
+      attn_type: sdpa
+      spmd_backend: default
+      dtype: bfloat16
+      use_remove_padding: false
+      activation_checkpoint: none
+      max_seq_len: 1024
+      tensor_parallel_size: 2
+      data_parallel_size: 1
+      data_parallel_replicate_size: 1
+      data_parallel_shard_size: 1
+      param_offload: false
+      optimizer_offload: false
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    log_prob_use_dynamic_bsz: false
+    torchtitan:
+      <<: *neuron_engine
+      forward_only: true
+  rollout:
+    name: vllm
+    nnodes: 1
+    n_gpus_per_node: 2
+    tensor_model_parallel_size: 2
+    dtype: bfloat16
+    load_format: auto
+    n: 2
+    temperature: 1.0
+    top_k: 256
+    top_p: 1.0
+    max_model_len: 1024
+    max_num_batched_tokens: 1024
+    max_num_seqs: 4
+    calculate_log_probs: true
+    log_prob_micro_batch_size_per_gpu: 1
+    log_prob_use_dynamic_bsz: false
+    enable_sleep_mode: false
+    free_cache_engine: false
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    agent:
+      num_workers: 1
+    checkpoint_engine:
+      backend: neuron_nixl
+      custom_backend_module: verl_hardware_plugin.accelerators.neuron.weight_sync.checkpoint_engine
+      update_weights_bucket_megabytes: 64
+
+reward:
+  num_workers: 1
+
+trainer:
+  device: neuron
+  use_v1: true
+  nnodes: 1
+  n_gpus_per_node: 2
+  total_epochs: 1
+  total_training_steps: 2
+  project_name: neuron_gsm8k
+  experiment_name: qwen3_0_6b_smoke
+  logger: [console]
+  val_before_train: false
+  test_freq: -1
+  save_freq: -1
+  resume_mode: disable
+  v1:
+    trainer_mode: separate_async
+    separate_async:
+      parameter_sync_step: 1
+YAML
+```
+
+The training sequence length is `512 + 512 = 1024`. Keep
+`torchtitan.max_seq_len` equal to the prompt plus response limit and divisible by
+512 when changing these values. This backend uses fixed micro-batches and padded
+inputs. CP, EP, and PP remain one; packed inputs, offloading, MoE, quantization,
+learned critics, multimodal inputs, colocated rollout, and multi-node jobs are
+outside the supported configuration.
+
+### Launch and inspect the run
+
+```bash
+export CONFIG_NAME=neuron_gsm8k
+export RUN_DIR="$NEURON_EXAMPLE_DIR/runs/$(date +%Y%m%d-%H%M%S)"
+bash "$PLUGIN_DIR/scripts/accelerators/neuron/run_neuron.sh"
+```
+
+The launcher checks the environments and devices, starts verl, and writes logs
+to `$RUN_DIR/train.log`. It refuses an existing Ray cluster or occupied
+NeuronCores. Cold native compilation can take more than 15 minutes before
+training starts. Preserve the NKI and vLLM caches at their original paths:
+compiled graphs contain absolute paths to NKI binaries.
+
+Look for two completed training steps and their console metrics. This example
+disables evaluation and disk checkpoints; actor weights still synchronize to
+rollout through `neuron_nixl`. For a longer run with evaluation, pass Hydra
+overrides to the same launcher:
+
+```bash
+RUN_DIR="$NEURON_EXAMPLE_DIR/runs/longer-$(date +%Y%m%d-%H%M%S)" \
+  bash "$PLUGIN_DIR/scripts/accelerators/neuron/run_neuron.sh" \
+  data.train_max_samples=-1 data.val_max_samples=32 \
+  trainer.total_training_steps=20 trainer.test_freq=5
+```

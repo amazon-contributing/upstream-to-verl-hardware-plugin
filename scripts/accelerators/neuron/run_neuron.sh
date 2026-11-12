@@ -28,7 +28,6 @@ export VERL_NEURON_PROCESS_ROLE=controller
 export NKI_COMPILE_CACHE_URL=${NKI_COMPILE_CACHE_URL:-"$(dirname "$VERL_NEURON_TRAIN_PYTHON")/../../nki-cache"}
 neuron_python=$VERL_NEURON_ROLLOUT_PYTHON
 export LD_LIBRARY_PATH="$(dirname "$neuron_python")/../lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-"$neuron_python" "$ROOT/scripts/accelerators/neuron/check_neuron_environment.py" --hardware
 # Released verl does not merge PlatformBase.get_ray_init_kwargs(). Supply
 # every runtime setting explicitly, including the two interpreter paths.
 runtime_overrides=$("$neuron_python" - <<'PY'
@@ -48,19 +47,6 @@ if pgrep -x raylet >/dev/null; then
     echo "An existing Ray cluster is running. Use an idle host; this script will not stop it." >&2
     exit 1
 fi
-"$neuron_python" - <<'PY'
-import json
-import subprocess
-from importlib.metadata import version
-
-if version("TransferQueue") != "0.1.11":
-    raise SystemExit("The Neuron runtime requires TransferQueue==0.1.11 for async checkpoint save/load.")
-
-devices = json.loads(subprocess.check_output(["/opt/aws/neuron/bin/neuron-ls", "--json-output"]))
-occupied = [process for device in devices for process in device.get("neuron_processes", [])]
-if occupied:
-    raise SystemExit(f"NeuronCores are already occupied; this launcher will not stop their owners: {occupied}")
-PY
 export RUN_DIR=${RUN_DIR:-${TMPDIR:-/tmp}/verl-neuron-$(date +%Y%m%d-%H%M%S)}
 mkdir -p "$RUN_DIR"
 cd "$RUN_DIR"

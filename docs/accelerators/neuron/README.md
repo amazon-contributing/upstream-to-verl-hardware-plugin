@@ -274,11 +274,11 @@ export RUN_DIR="$NEURON_EXAMPLE_DIR/runs/$(date +%Y%m%d-%H%M%S)"
 bash "$PLUGIN_DIR/scripts/accelerators/neuron/run_neuron.sh"
 ```
 
-The launcher checks the environments and devices, starts verl, and writes logs
-to `$RUN_DIR/train.log`. It refuses an existing Ray cluster or occupied
-NeuronCores. Cold native compilation can take more than 15 minutes before
-training starts. Preserve the NKI and vLLM caches at their original paths:
-compiled graphs contain absolute paths to NKI binaries.
+The launcher starts verl and writes logs to `$RUN_DIR/train.log`. It refuses an
+existing Ray cluster. Run the environment check in the setup section before
+launching. Cold native compilation can take more than 15 minutes before training
+starts. Preserve the NKI and vLLM caches at their original paths: compiled graphs
+contain absolute paths to NKI binaries.
 
 Look for two completed training steps and their console metrics. This example
 disables evaluation and disk checkpoints; actor weights still synchronize to

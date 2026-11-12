@@ -8,48 +8,82 @@ GRPO example using Qwen3-0.6B and GSM8K on one Trainium2 host.
 
 ### Prepare the host
 
-Use an idle Trainium2 host with access to its Neuron and EFA devices. The
-validated system environment is:
+Start with an idle **Ubuntu 26.04 Trainium2 host** with EFA enabled. The pinned
+TorchNeuron binary requires GLIBC 2.43. Run these commands on the host to install
+the system dependencies:
 
-| Component | Version / requirement |
-| --- | --- |
-| OS | Ubuntu 26.04; the pinned TorchNeuron binary requires GLIBC 2.43 |
-| Neuron driver | `2.31.7.0` |
-| Neuron runtime | `2.35.30.0-d2725ccb8` |
-| Neuron collectives | `2.35.43.0-354ad3064` |
-| EFA userspace libfabric | `2.7.0amzn2.0`, with EFA kernel support |
-| System libraries | `libnuma-dev` for `libnuma.so`; CUDA 12 libraries/stubs, including `libcuda.so.1`, for NIXL |
-| Setup tools | Git, curl, and [uv](https://docs.astral.sh/uv/getting-started/installation/) `0.11.14` |
+```bash
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends \
+  ca-certificates curl git gnupg libnuma-dev "linux-headers-$(uname -r)"
 
-Provision these system dependencies before running the installer. The installer
-creates Python environments; it does not install host drivers, EFA, or system
-libraries.
+NEURON_SETUP_DIR=$(mktemp -d)
+
+# Install the Neuron driver, runtime, collectives, and command-line tools.
+curl -fsSL https://apt.repos.neuron.amazonaws.com/GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB \
+  -o "$NEURON_SETUP_DIR/neuron.asc"
+sudo gpg --dearmor --yes -o /usr/share/keyrings/aws-neuron.gpg \
+  "$NEURON_SETUP_DIR/neuron.asc"
+echo "deb [signed-by=/usr/share/keyrings/aws-neuron.gpg] https://apt.repos.neuron.amazonaws.com resolute main" \
+  | sudo tee /etc/apt/sources.list.d/neuron.list
+sudo apt-get update
+sudo apt-get install -y \
+  aws-neuronx-dkms=2.31.7.0 \
+  aws-neuronx-runtime-lib=2.35.30.0-d2725ccb8 \
+  aws-neuronx-collectives=2.35.43.0-354ad3064 \
+  aws-neuronx-tools
+
+# EFA 1.51.0 supplies libfabric 2.7.0amzn2.0 and the EFA kernel driver.
+curl -fsSL https://efa-installer.amazonaws.com/aws-efa-installer-1.51.0.tar.gz \
+  -o "$NEURON_SETUP_DIR/efa.tar.gz"
+tar -xzf "$NEURON_SETUP_DIR/efa.tar.gz" -C "$NEURON_SETUP_DIR"
+(
+  cd "$NEURON_SETUP_DIR/aws-efa-installer"
+  sudo bash efa_installer.sh --yes --skip-mpi --skip-plugin
+)
+
+# Install the CUDA 12 driver stub needed by NIXL, using NVIDIA's Ubuntu 24.04 repo.
+curl -fsSL \
+  https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb \
+  -o "$NEURON_SETUP_DIR/cuda-keyring.deb"
+sudo dpkg -i "$NEURON_SETUP_DIR/cuda-keyring.deb"
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends cuda-cudart-dev-12-6
+sudo install -d /opt/aws/neuron/cuda-stubs
+sudo ln -sfn /usr/local/cuda-12.6/targets/x86_64-linux/lib/stubs/libcuda.so \
+  /opt/aws/neuron/cuda-stubs/libcuda.so.1
+
+sudo modprobe neuron
+cat /sys/module/neuron/version
+/opt/amazon/efa/bin/fi_info --version
+/opt/amazon/efa/bin/fi_info -p efa
+```
+
+The version checks should report Neuron driver `2.31.7.0` and libfabric
+`2.7.0amzn2.0`, and `fi_info -p efa` should list an EFA provider. If an older
+Neuron driver is still loaded after installation, reboot the host before
+continuing.
 
 ### Install the Python dependencies
 
-Training and serving require different PyTorch and TorchNeuron versions, so the
-[installer](../../../scripts/accelerators/neuron/setup_neuron_public.sh) creates
-two environments:
-
-| Environment | Purpose | Main dependencies |
-| --- | --- | --- |
-| `training` | Actor and frozen reference | PyTorch `2.14.0+cpu`, TorchNeuron `2.14.3.0.281+dc70ffa`, TorchTitan Neuron `release-2.33.0` |
-| `serving` | Rollout, controller, and reward workers | PyTorch `2.13.0+cpu`, lite `2.13.0.1.0.3112+653bc48f`, vLLM `0.29.0`, vLLM-Neuron `v0.29.0.1.2.0` |
-
-Both use managed Python 3.12.13, verl 0.9.1, and this plugin installed in editable
-mode. The installer pins the required runtime packages and source revisions,
-then uses uv to resolve transitive dependencies. No external requirements files
-are needed. It excludes unused CUDA kernels, audio/video packages, and
-`nixl-cu13`; generic dependency checks may report these intentional exclusions.
+The [setup script](../../../scripts/accelerators/neuron/setup_neuron_public.sh)
+installs managed Python 3.12.13, verl 0.9.1, this plugin, and the pinned Neuron
+dependencies. It creates `training` for the actor and frozen reference, and
+`serving` for rollout, controller, and reward workers. These environments use
+different PyTorch and TorchNeuron versions. No external requirements files are
+needed.
 
 Run the following from the plugin checkout. Set `PUBLIC_ENVS` to an absolute,
 writable path with room for both environments, model weights, and compiler caches.
 Keep using the same shell for the example below.
 
 ```bash
+curl -fsSL https://astral.sh/uv/0.11.14/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+
 export PLUGIN_DIR="$PWD"
 export PUBLIC_ENVS=/absolute/path/to/neuron-envs
-export LD_LIBRARY_PATH="/opt/aws/neuron/lib:/opt/amazon/efa/lib:/opt/amazon/efa/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="/opt/aws/neuron/lib:/opt/aws/neuron/cuda-stubs:/opt/amazon/efa/lib:/opt/amazon/efa/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 bash "$PLUGIN_DIR/scripts/accelerators/neuron/setup_neuron_public.sh" "$PUBLIC_ENVS"
 

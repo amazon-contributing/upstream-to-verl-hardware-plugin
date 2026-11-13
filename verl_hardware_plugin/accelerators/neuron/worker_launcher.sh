@@ -3,7 +3,9 @@
 # Licensed under the Apache License, Version 2.0.
 set -euo pipefail
 
-if [[ "${VERL_NEURON_SERVING:-}" == 1 ]]; then
+# Ray workers inherit the controller role. An explicit rollout role takes
+# precedence over WG_BACKEND; otherwise worker-group processes are trainers.
+if [[ "${VERL_NEURON_PROCESS_ROLE:-}" == rollout ]]; then
     export VERL_NEURON_PROCESS_ROLE=rollout
 elif [[ "${WG_BACKEND:-}" == ray ]]; then
     export VERL_NEURON_PROCESS_ROLE=trainer

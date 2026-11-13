@@ -19,8 +19,11 @@ from verl_hardware_plugin.accelerators.neuron.runtime import public_runtime_env
     "worker_environment,role",
     [
         ({}, "controller"),
+        ({"VERL_NEURON_PROCESS_ROLE": "controller"}, "controller"),
         ({"WG_BACKEND": "ray", "RANK": "3", "NEURON_RT_VISIBLE_CORES": "7"}, "trainer"),
-        ({"WG_BACKEND": "ray", "VERL_NEURON_SERVING": "1"}, "rollout"),
+        ({"WG_BACKEND": "ray", "VERL_NEURON_PROCESS_ROLE": "controller"}, "trainer"),
+        ({"VERL_NEURON_PROCESS_ROLE": "rollout"}, "rollout"),
+        ({"WG_BACKEND": "ray", "VERL_NEURON_PROCESS_ROLE": "rollout"}, "rollout"),
     ],
 )
 def test_launcher_uses_shared_interpreter_for_every_role(tmp_path, monkeypatch, worker_environment, role):
@@ -29,7 +32,7 @@ def test_launcher_uses_shared_interpreter_for_every_role(tmp_path, monkeypatch, 
     path.chmod(0o755)
     monkeypatch.setenv("VERL_NEURON_PYTHON", str(path))
     environment = os.environ.copy()
-    for key in ("WG_BACKEND", "VERL_NEURON_SERVING", "RANK", "NEURON_RT_VISIBLE_CORES"):
+    for key in ("WG_BACKEND", "VERL_NEURON_PROCESS_ROLE", "RANK", "NEURON_RT_VISIBLE_CORES"):
         environment.pop(key, None)
     environment.update(worker_environment)
     launcher = Path(__file__).parents[3] / "verl_hardware_plugin/accelerators/neuron/worker_launcher.sh"
@@ -69,7 +72,6 @@ def test_launcher_emits_only_valid_hydra_overrides(monkeypatch):
     monkeypatch.setenv("VERL_NEURON_PYTHON", sys.executable)
     monkeypatch.setenv("VERL_PLATFORM", "aws")
     monkeypatch.setenv("VERL_NEURON_PROCESS_ROLE", "controller")
-    monkeypatch.setenv("VERL_NEURON_SERVING", "0")
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     overrides = result.stdout.splitlines()
     assert all(line.startswith(("ray_kwargs.", "++ray_kwargs.")) for line in overrides), result.stdout
@@ -85,7 +87,6 @@ def test_controller_cannot_import_training_runtime(monkeypatch):
     from verl_hardware_plugin.accelerators.neuron.runtime import ensure_neuron
 
     monkeypatch.setenv("VERL_NEURON_PROCESS_ROLE", "controller")
-    monkeypatch.delenv("VERL_NEURON_SERVING", raising=False)
     ensure_neuron.cache_clear()
     with pytest.raises(RuntimeError, match="Only Neuron training"):
         ensure_neuron()
@@ -101,7 +102,6 @@ def test_non_training_workers_block_installed_training_packages(tmp_path, monkey
     monkeypatch.delitem(sys.modules, module, raising=False)
     monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
     monkeypatch.setenv("VERL_NEURON_PROCESS_ROLE", role)
-    monkeypatch.delenv("VERL_NEURON_SERVING", raising=False)
     isolate_training_imports()
     isolate_training_imports()
     with pytest.raises(ModuleNotFoundError, match="only available in Neuron training workers"):
@@ -112,7 +112,6 @@ def test_training_import_filter_preserves_trainer_and_lite_imports(monkeypatch):
     from verl_hardware_plugin.accelerators.neuron.runtime import _TrainingImportFinder
 
     finder = _TrainingImportFinder()
-    monkeypatch.delenv("VERL_NEURON_SERVING", raising=False)
     monkeypatch.setenv("VERL_NEURON_PROCESS_ROLE", "trainer")
     for module in ("torchtitan", "torchtitan_neuron", "torch_neuronx", "torch_neuronx._C"):
         assert finder.find_spec(module) is None
@@ -144,7 +143,6 @@ assert not getattr(torch.compile, "_neuron_wrapped", False)
             "VERL_PLATFORM": "aws",
             "VERL_USE_EXTERNAL_PLUGINS": "hardware",
             "VERL_NEURON_PROCESS_ROLE": "controller",
-            "VERL_NEURON_SERVING": "0",
             "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
         },
         capture_output=True,
@@ -179,7 +177,7 @@ def test_ray_exchanges_batches_in_shared_environment():
         sent = TensorDict({"tokens": torch.arange(12).reshape(3, 4)}, batch_size=[3])
         for expected_role, environment in (
             ("trainer", {"WG_BACKEND": "ray"}),
-            ("rollout", {"VERL_NEURON_SERVING": "1"}),
+            ("rollout", {"VERL_NEURON_PROCESS_ROLE": "rollout"}),
             ("controller", {}),
         ):
             worker = BatchReceiver.options(

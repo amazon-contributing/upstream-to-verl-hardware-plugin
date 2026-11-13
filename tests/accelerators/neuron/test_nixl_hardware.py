@@ -28,7 +28,6 @@ def test_native_to_lite_nixl_without_engine_dependency(tmp_path):
             environment = {
                 **os.environ,
                 "VERL_PLATFORM": "aws",
-                "VERL_NEURON_SERVING": "1" if role == "receiver" else "0",
                 "VERL_NEURON_PROCESS_ROLE": "rollout" if role == "receiver" else "trainer",
                 "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
                 "VLLM_PLUGINS": "",

@@ -24,7 +24,6 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 def serving_environment():
     environment = {
         "VERL_PLATFORM": "aws",
-        "VERL_NEURON_SERVING": "1",
         "VERL_NEURON_PROCESS_ROLE": "rollout",
         "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
         "VLLM_PLUGINS": "neuron",

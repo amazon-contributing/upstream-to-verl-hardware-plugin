@@ -13,9 +13,7 @@ from pathlib import Path
 
 
 def process_role():
-    """Keep controller imports independent of both native runtime packages."""
-    if os.environ.get("VERL_NEURON_SERVING") == "1":
-        return "rollout"
+    """Return the role selected before importing native Neuron runtimes."""
     role = os.environ.get("VERL_NEURON_PROCESS_ROLE", "trainer")
     if role not in ("controller", "trainer", "rollout"):
         raise ValueError(f"Unknown Neuron process role: {role}")

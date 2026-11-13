@@ -61,11 +61,23 @@ def test_platform_resources():
         platform.ray_resource_options(0.5)
 
 
-def test_cpu_controller_does_not_query_neuron_runtime(monkeypatch):
-    monkeypatch.setenv("NEURON_RT_VISIBLE_CORES", "")
+@pytest.mark.parametrize("role,visible", [("controller", "0"), ("trainer", ""), ("rollout", "")])
+def test_cpu_controller_does_not_query_neuron_runtime(monkeypatch, role, visible):
+    monkeypatch.setenv("VERL_NEURON_PROCESS_ROLE", role)
+    monkeypatch.setenv("NEURON_RT_VISIBLE_CORES", visible)
     platform = PlatformNeuron()
     platform._device_module = None
     assert not platform.is_available()
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_rollout_availability_does_not_initialize_training_runtime(monkeypatch, available):
+    monkeypatch.setenv("VERL_NEURON_PROCESS_ROLE", "rollout")
+    monkeypatch.setenv("NEURON_RT_VISIBLE_CORES", "0")
+    platform = PlatformNeuron()
+    platform._device_module = None
+    monkeypatch.setattr(platform, "is_platform_available", lambda: available)
+    assert platform.is_available() is available
 
 
 def test_ray_device_count_uses_the_process_view(monkeypatch):

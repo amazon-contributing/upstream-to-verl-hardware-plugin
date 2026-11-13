@@ -28,7 +28,6 @@ def test_native_to_lite_nixl_without_engine_dependency(tmp_path):
             environment = {
                 **os.environ,
                 "VERL_PLATFORM": "aws",
-                "VERL_NEURON_SERVING": "1" if role == "receiver" else "0",
                 "VERL_NEURON_PROCESS_ROLE": "rollout" if role == "receiver" else "trainer",
                 "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
                 "VLLM_PLUGINS": "",
@@ -46,8 +45,7 @@ def test_native_to_lite_nixl_without_engine_dependency(tmp_path):
             )
             log_path = tmp_path / f"{role}.log"
             with log_path.open("w") as output:
-                executable_variable = "VERL_NEURON_TRAIN_PYTHON" if role == "sender" else "VERL_NEURON_ROLLOUT_PYTHON"
-                executable = os.environ.get(executable_variable, sys.executable)
+                executable = os.environ.get("VERL_NEURON_PYTHON", sys.executable)
                 environment["LD_LIBRARY_PATH"] = os.pathsep.join(
                     filter(None, (str(Path(executable).parent.parent / "lib"), environment.get("LD_LIBRARY_PATH")))
                 )

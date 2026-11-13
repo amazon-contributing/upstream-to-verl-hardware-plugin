@@ -67,40 +67,36 @@ continuing.
 ### Install the Python dependencies
 
 The [setup script](../../../scripts/accelerators/neuron/setup_neuron_public.sh)
-installs managed Python 3.12.13, verl 0.9.1, this plugin, and the pinned Neuron
-dependencies. It creates `training` for the actor and frozen reference, and
-`serving` for rollout, controller, and reward workers. These environments use
-different PyTorch and TorchNeuron versions. No external requirements files are
-needed.
+creates one virtual environment with Python 3.12.13, PyTorch 2.13.0 (CPU wheel),
+verl 0.9.1, Neuron TorchTitan, and vLLM-Neuron. All workers use this environment.
 
-Run the following from the plugin checkout. Set `PUBLIC_ENVS` to an absolute,
-writable path with room for both environments, model weights, and compiler caches.
-Keep using the same shell for the example below.
+Run the following from the plugin checkout. Set `PUBLIC_ENV_ROOT` to an absolute,
+writable path with room for the environment, model weights, and compiler caches.
+Activate it once and keep using the same shell for the example below.
 
 ```bash
 curl -fsSL https://astral.sh/uv/0.11.14/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 
 export PLUGIN_DIR="$PWD"
-export PUBLIC_ENVS=/absolute/path/to/neuron-envs
-export LD_LIBRARY_PATH="/opt/aws/neuron/lib:/opt/aws/neuron/cuda-stubs:/opt/amazon/efa/lib:/opt/amazon/efa/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PUBLIC_ENV_ROOT=/absolute/path/to/neuron-env
+bash "$PLUGIN_DIR/scripts/accelerators/neuron/setup_neuron_public.sh" "$PUBLIC_ENV_ROOT"
+source "$PUBLIC_ENV_ROOT/venv/bin/activate"
 
-bash "$PLUGIN_DIR/scripts/accelerators/neuron/setup_neuron_public.sh" "$PUBLIC_ENVS"
+export VERL_NEURON_PYTHON="$VIRTUAL_ENV/bin/python"
+export LD_LIBRARY_PATH="$VIRTUAL_ENV/lib:/opt/aws/neuron/lib:/opt/aws/neuron/cuda-stubs:/opt/amazon/efa/lib:/opt/amazon/efa/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# Use controller settings for data preparation; the launcher sets each worker's role.
+export VERL_PLATFORM=aws
+export VERL_NEURON_PROCESS_ROLE=controller
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+export VLLM_PLUGINS=""
 
-export VERL_NEURON_TRAIN_PYTHON="$PUBLIC_ENVS/training/bin/python"
-export VERL_NEURON_ROLLOUT_PYTHON="$PUBLIC_ENVS/serving/bin/python"
-"$VERL_NEURON_ROLLOUT_PYTHON" \
-  "$PLUGIN_DIR/scripts/accelerators/neuron/check_neuron_environment.py" --hardware
+python "$PLUGIN_DIR/scripts/accelerators/neuron/check_neuron_environment.py" --hardware
 ```
 
-Resolve any environment-check failures before launching training. There is no
-need to activate either environment: the launcher selects the appropriate
-interpreter for each worker.
-
-The example uses the default uv, Hugging Face, and vLLM cache locations.
-The launcher defaults `NKI_COMPILE_CACHE_URL` to `$PUBLIC_ENVS/nki-cache`.
-Set `UV_CACHE_DIR`, `HF_HOME`, `VLLM_CACHE_ROOT`, or `NKI_COMPILE_CACHE_URL` only
-if you need a different cache location.
+Resolve any check failures before training. `VERL_NEURON_PYTHON` selects the same
+interpreter for every worker. Caches use their defaults, with NKI binaries stored
+in `$PUBLIC_ENV_ROOT/nki-cache`.
 
 ## 2. Run a minimal GRPO example
 
@@ -120,24 +116,17 @@ release. The script creates the prompt and answer fields used by verl's built-in
 GSM8K reward function.
 
 ```bash
-export NEURON_EXAMPLE_DIR="$PUBLIC_ENVS/examples/gsm8k"
+export NEURON_EXAMPLE_DIR="$PUBLIC_ENV_ROOT/examples/gsm8k"
 export MODEL_DIR="$NEURON_EXAMPLE_DIR/Qwen3-0.6B"
 export DATA_DIR="$NEURON_EXAMPLE_DIR/data"
 export CONFIG_PATH="$NEURON_EXAMPLE_DIR/config"
 mkdir -p "$DATA_DIR" "$CONFIG_PATH"
 
-# Use the serving environment for data preparation and the controller.
-export VERL_PLATFORM=aws
-export VERL_NEURON_PROCESS_ROLE=controller
-export TORCH_DEVICE_BACKEND_AUTOLOAD=0
-export VLLM_PLUGINS=""
-export LD_LIBRARY_PATH="$PUBLIC_ENVS/serving/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-
-"$PUBLIC_ENVS/serving/bin/hf" download Qwen/Qwen3-0.6B --local-dir "$MODEL_DIR"
+hf download Qwen/Qwen3-0.6B --local-dir "$MODEL_DIR"
 curl -fsSL \
   https://raw.githubusercontent.com/verl-project/verl/1876b06d0a3e4e71e06230be10af14492ca8a75b/examples/data_preprocess/gsm8k.py \
   -o "$NEURON_EXAMPLE_DIR/prepare_gsm8k.py"
-"$VERL_NEURON_ROLLOUT_PYTHON" "$NEURON_EXAMPLE_DIR/prepare_gsm8k.py" \
+python "$NEURON_EXAMPLE_DIR/prepare_gsm8k.py" \
   --local_save_dir "$DATA_DIR"
 ```
 

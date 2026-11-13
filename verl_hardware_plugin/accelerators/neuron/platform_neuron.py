@@ -69,7 +69,7 @@ class PlatformNeuron(PlatformBase):
     def is_available(self):
         if process_role() == "controller" or os.environ.get("NEURON_RT_VISIBLE_CORES") == "":
             return False
-        if os.environ.get("VERL_NEURON_SERVING") == "1":
+        if process_role() == "rollout":
             return self.is_platform_available()
         return self.is_platform_available() and self.device_module.is_available()
 

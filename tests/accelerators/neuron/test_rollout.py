@@ -60,7 +60,7 @@ def server(returns):
 def test_rollout_environment_does_not_autoload_training_backend(neuron_vllm):
     environment = neuron_vllm.serving_environment()
     assert environment["TORCH_DEVICE_BACKEND_AUTOLOAD"] == "0"
-    assert environment["VERL_NEURON_SERVING"] == "1"
+    assert environment["VERL_NEURON_PROCESS_ROLE"] == "rollout"
     assert environment["VLLM_NEURON_BACKEND"] == "neuron_native"
     assert environment["VLLM_USE_V2_MODEL_RUNNER"] == "0"
 

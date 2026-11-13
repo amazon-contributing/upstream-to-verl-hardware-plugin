@@ -20,16 +20,15 @@ export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
 
 public_overrides=()
-: "${VERL_NEURON_TRAIN_PYTHON:?Set both public runtime interpreters}"
-: "${VERL_NEURON_ROLLOUT_PYTHON:?Set both public runtime interpreters}"
+: "${VERL_NEURON_PYTHON:?Set the shared Neuron Python executable}"
 export VERL_NEURON_PROCESS_ROLE=controller
-# Persist NKI binaries with the environments. Cached vLLM graphs contain
+# Persist NKI binaries with the environment. Cached vLLM graphs contain
 # absolute paths to these files and may outlive a container's /var/tmp.
-export NKI_COMPILE_CACHE_URL=${NKI_COMPILE_CACHE_URL:-"$(dirname "$VERL_NEURON_TRAIN_PYTHON")/../../nki-cache"}
-neuron_python=$VERL_NEURON_ROLLOUT_PYTHON
+export NKI_COMPILE_CACHE_URL=${NKI_COMPILE_CACHE_URL:-"$(dirname "$VERL_NEURON_PYTHON")/../../nki-cache"}
+neuron_python=$VERL_NEURON_PYTHON
 export LD_LIBRARY_PATH="$(dirname "$neuron_python")/../lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 # Released verl does not merge PlatformBase.get_ray_init_kwargs(). Supply
-# every runtime setting explicitly, including the two interpreter paths.
+# every runtime setting explicitly, including the shared interpreter path.
 runtime_overrides=$("$neuron_python" - <<'PY'
 import json
 import sys

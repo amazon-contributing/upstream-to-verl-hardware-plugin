@@ -2,7 +2,7 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""Check the public recipe's two interpreters without loading a device runtime."""
+"""Check the shared public environment without loading a device runtime."""
 
 import argparse
 import json
@@ -45,48 +45,37 @@ def check_system():
 
 
 def check(require_hardware=False):
-    reports = {}
-    for role, variable in (("training", "VERL_NEURON_TRAIN_PYTHON"), ("serving", "VERL_NEURON_ROLLOUT_PYTHON")):
-        executable = os.environ[variable]
-        reports[role] = json.loads(
-            subprocess.check_output([executable, "-c", PROBE], env={**os.environ, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"})
-        )
-    for role, report in reports.items():
-        packages = report["packages"]
-        expected = {
-            "verl": "0.9.1",
-            "torch": "2.14.0+cpu" if role == "training" else "2.13.0+cpu",
-            "ray": "2.55.0",
-            "TransferQueue": "0.1.11",
-            "neuronx-cc": "2.28.7631.0+8f7b0cf5",
-            "nki": "0.7.0+37713544100.gfede04bb",
-            "nixl-cu12": "1.3.2",
-        }
-        expected.update(
-            {"torch-neuronx": "2.14.3.0.281+dc70ffa", "torchtitan-neuron": "0.2.2+neuron.1"}
-            if role == "training"
-            else {
-                "vllm": "0.29.0",
-                "vllm-neuron": "0.29.0.1.2.0",
-                "libtorch-neuronx-lite": "2.13.0.1.0.3112+653bc48f",
-            }
-        )
-        if report["python"] != [3, 12]:
-            raise SystemExit(f"{role}: the public recipe requires Python 3.12")
-        if report["libc"][0] != "glibc" or tuple(map(int, report["libc"][1].split("."))) < (2, 43):
-            raise SystemExit(f"{role}: public TorchNeuron requires GLIBC >= 2.43; use a compatible system environment")
-        if report["forbidden"]:
-            raise SystemExit(f"{role}: remove neuron-rl-core from the public environment")
-        forbidden_runtime = "libtorch-neuronx-lite" if role == "training" else "torch-neuronx"
-        if forbidden_runtime in packages:
-            raise SystemExit(f"{role}: remove {forbidden_runtime}; keep the two runtimes in separate environments")
-        if "nixl-cu13" in packages:
-            raise SystemExit(f"{role}: remove nixl-cu13 so NIXL uses the pinned CUDA 12 backend")
-        for name, version in expected.items():
-            if packages.get(name) != version:
-                raise SystemExit(f"{role}: expected {name}=={version}, found {packages.get(name)}")
-    if reports["training"]["packages"].get("ray") != reports["serving"]["packages"].get("ray"):
-        raise SystemExit("Both environments must have the same Ray version")
+    executable = os.environ["VERL_NEURON_PYTHON"]
+    report = json.loads(
+        subprocess.check_output([executable, "-c", PROBE], env={**os.environ, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"})
+    )
+    packages = report["packages"]
+    expected = {
+        "verl": "0.9.1",
+        "torch": "2.13.0+cpu",
+        "ray": "2.55.0",
+        "TransferQueue": "0.1.11",
+        "neuronx-cc": "2.28.7631.0+8f7b0cf5",
+        "nki": "0.7.0+37713544100.gfede04bb",
+        "nixl-cu12": "1.3.2",
+        "torch-neuronx": "2.13.3.0.283+dc70ffa",
+        "torchtitan-neuron": "0.2.2+neuron.1",
+        "vllm": "0.29.0",
+        "vllm-neuron": "0.29.0.1.2.0",
+        "libtorch-neuronx-lite": "2.13.0.1.0.3112+653bc48f",
+    }
+    if report["python"] != [3, 12]:
+        raise SystemExit("The public recipe requires Python 3.12")
+    if report["libc"][0] != "glibc" or tuple(map(int, report["libc"][1].split("."))) < (2, 43):
+        raise SystemExit("Public TorchNeuron requires GLIBC >= 2.43; use a compatible system environment")
+    if report["forbidden"]:
+        raise SystemExit("Remove neuron-rl-core from the public environment")
+    if "nixl-cu13" in packages:
+        raise SystemExit("Remove nixl-cu13 so NIXL uses the pinned CUDA 12 backend")
+    for name, version in expected.items():
+        if packages.get(name) != version:
+            raise SystemExit(f"Expected {name}=={version}, found {packages.get(name)}")
+    reports = {"environment": report}
     reports["system"] = check_system()
     if require_hardware:
         expected = {

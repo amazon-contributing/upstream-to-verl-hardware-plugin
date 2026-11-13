@@ -23,29 +23,24 @@ def process_role():
 
 
 def public_runtime_env():
-    """Route Ray workers before Python imports either PyTorch runtime.
+    """Launch every Ray worker in the shared Neuron Python environment.
 
     Verl supplies WG_BACKEND/rank variables in each training worker's runtime_env.
-    A launcher inherited through Ray preserves those variables while selecting the
-    interpreter. CPU actors and core leases use the controller interpreter.
+    A launcher inherited through Ray preserves those variables and selects the
+    process role before imports, so each worker loads only its native runtime.
     """
-    training = os.environ.get("VERL_NEURON_TRAIN_PYTHON")
-    serving = os.environ.get("VERL_NEURON_ROLLOUT_PYTHON")
-    if not training and not serving:
+    executable = os.environ.get("VERL_NEURON_PYTHON")
+    if not executable:
         return {}
-    if not training or not serving:
-        raise ValueError("Set both VERL_NEURON_TRAIN_PYTHON and VERL_NEURON_ROLLOUT_PYTHON")
-    for executable in (training, serving):
-        if not Path(executable).is_absolute() or not os.access(executable, os.X_OK):
-            raise ValueError(f"Neuron Python must be an absolute executable path: {executable}")
+    if not Path(executable).is_absolute() or not os.access(executable, os.X_OK):
+        raise ValueError(f"Neuron Python must be an absolute executable path: {executable}")
     import shlex
 
     launcher = Path(__file__).with_name("worker_launcher.sh")
     return {
         "py_executable": f"/bin/bash {shlex.quote(str(launcher))}",
         "env_vars": {
-            "VERL_NEURON_TRAIN_PYTHON": training,
-            "VERL_NEURON_ROLLOUT_PYTHON": serving,
+            "VERL_NEURON_PYTHON": executable,
             "VERL_NEURON_PROCESS_ROLE": "controller",
             "VERL_PLATFORM": "aws",
             "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
@@ -66,6 +61,28 @@ class CoreLease:
 
         context = ray.get_runtime_context()
         return context.get_node_id(), context.get_accelerator_ids()["neuron_cores"]
+
+
+class _TrainingImportFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if process_role() != "trainer" and fullname.split(".")[0] in (
+            "torchtitan",
+            "torchtitan_neuron",
+            "torch_neuronx",
+        ):
+            raise ModuleNotFoundError(f"{fullname} is only available in Neuron training workers", name=fullname)
+        return None
+
+
+def isolate_training_imports():
+    """Keep eager training imports out of controllers and lite rollout workers.
+
+    Verl discovers TorchTitan even in rollout processes. TorchTitan redirects
+    torch.compile to the training backend during import; loading that extension
+    beside lite leaves conflicting native symbols even if the import fails.
+    """
+    if not any(isinstance(finder, _TrainingImportFinder) for finder in sys.meta_path):
+        sys.meta_path.insert(0, _TrainingImportFinder())
 
 
 class _CUDAOnlyCheckpointFinder(importlib.abc.MetaPathFinder):

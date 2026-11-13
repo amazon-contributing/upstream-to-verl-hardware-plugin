@@ -27,23 +27,20 @@ with open(os.environ["SETUP_TEST_LOG"], "a") as log:
 if command == "git" and "rev-parse" in args:
     print((pathlib.Path(args[1]) / ".git" / "revision").read_text().strip())
 elif command == "uv":
-    if args[:2] == ["python", "find"]:
-        print(sys.executable)
-    elif args[0] == "venv":
+    if args[0] == "venv":
         target = pathlib.Path(args[-1]) / "bin" / "python"
         target.parent.mkdir(parents=True)
         target.write_text(pathlib.Path(sys.argv[0]).read_text())
         target.chmod(0o755)
     elif args[:2] == ["pip", "install"]:
-        role = pathlib.Path(args[args.index("--python") + 1]).parents[1].name
-        if role == os.environ.get("SETUP_TEST_FAIL"):
+        if os.environ.get("SETUP_TEST_FAIL"):
             sys.exit(19)
 """
 
 
 @pytest.fixture
 def installer(tmp_path):
-    root = tmp_path / "public environments"
+    root = tmp_path / "public environment"
     for name, revision in (
         ("torchtitan-neuron", "b7582e986586051d7be85d03956afe169624aeda"),
         ("vllm-neuron", "eb6cb360f7cff6082e22a9437d8ce0ba3891304a"),
@@ -64,8 +61,6 @@ def installer(tmp_path):
         "UV_BIN": str(tools / "uv"),
         "SETUP_TEST_LOG": str(log),
     }
-    for name in ("NEURON_TRAINING_REQUIREMENTS", "NEURON_SERVING_REQUIREMENTS", "SETUP_TEST_FAIL"):
-        environment.pop(name, None)
 
     def run(fail=None):
         result = subprocess.run(
@@ -80,36 +75,37 @@ def installer(tmp_path):
     return run
 
 
-def test_setup_resolves_both_environments_without_external_requirements(installer):
+def test_setup_resolves_one_environment_for_training_and_rollout(installer):
     result, commands = installer()
     assert result.returncode == 0, result.stderr
+    venvs = [command for command in commands if command["args"][:1] == ["venv"]]
+    assert len(venvs) == 1
+    assert venvs[0]["args"][1:-1] == ["--managed-python", "--python", "3.12.13"]
     installs = [command for command in commands if command["args"][:2] == ["pip", "install"]]
-    assert len(installs) == 2
-    for command, torch_pin, runtime in zip(
-        installs,
-        ("torch==2.14.0+cpu", "torch==2.13.0+cpu"),
-        ("torch-neuronx==2.14.3.0.281+dc70ffa", "libtorch-neuronx-lite==2.13.0.1.0.3112+653bc48f"),
-        strict=True,
-    ):
-        args = command["args"]
-        assert torch_pin in args and runtime in args
-        assert args[args.index("--torch-backend") + 1] == "cpu"
-        assert "--no-deps" not in args and "--requirements" not in args and "-r" not in args
-        assert "verl[verl-core]==0.9.1" in args
-        assert "nixl-cu12==1.3.2" in args
-        assert {"nixl-cu13", "torchaudio", "flashinfer-python"} <= set(command["excluded"])
-        assert not {"torch", "apache-tvm-ffi", "xgrammar", "nixl-cu12"} & set(command["excluded"])
-        assert args.count("-e") == 2
-    assert "torch-neuronx==2.14.3.0.281+dc70ffa" not in installs[1]["args"]
+    assert len(installs) == 1
+    command = installs[0]
+    args = command["args"]
+    assert "torch==2.13.0+cpu" in args
+    assert "torch-neuronx==2.13.3.0.283+dc70ffa" in args
+    assert "libtorch-neuronx-lite==2.13.0.1.0.3112+653bc48f" in args
+    assert args[args.index("--python") + 1] == str(Path(venvs[0]["args"][-1]) / "bin/python")
+    assert args[args.index("--torch-backend") + 1] == "cpu"
+    assert "--no-deps" not in args and "--requirements" not in args and "-r" not in args
+    assert "verl[verl-core]==0.9.1" in args
+    assert "nixl-cu12==1.3.2" in args
+    assert {"nixl-cu13", "torchaudio", "flashinfer-python"} <= set(command["excluded"])
+    assert not {"torch", "apache-tvm-ffi", "xgrammar", "nixl-cu12"} & set(command["excluded"])
+    sources = [Path(args[index + 1]).name for index, arg in enumerate(args) if arg == "-e"]
+    assert sources == ["torchtitan-neuron", "vllm-neuron", SCRIPT.parents[3].name]
     assert commands[-1]["args"] == [str(SCRIPT.with_name("check_neuron_environment.py"))]
-    assert "export VERL_NEURON_ROLLOUT_PYTHON=" in result.stdout
+    assert "source " in result.stdout
+    assert 'export VERL_NEURON_PYTHON="$VIRTUAL_ENV/bin/python"' in result.stdout
 
 
-@pytest.mark.parametrize("role,expected_installs", [("training", 1), ("serving", 2)])
-def test_failed_resolution_stops_before_environment_check(installer, role, expected_installs):
-    result, commands = installer(fail=role)
+def test_failed_resolution_stops_before_environment_check(installer):
+    result, commands = installer(fail="1")
     assert result.returncode == 19
     installs = [command for command in commands if command["args"][:2] == ["pip", "install"]]
-    assert len(installs) == expected_installs
+    assert len(installs) == 1
     assert commands[-1] == installs[-1]
     assert "export VERL_NEURON_" not in result.stdout

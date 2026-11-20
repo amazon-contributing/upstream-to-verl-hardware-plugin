@@ -172,10 +172,15 @@ class NeuronWorkerExtension:
             if (int(model.rank), int(model.world_size)) != (rank, topology.rollout_tp):
                 raise ValueError("Resident model and rollout TP coordinates disagree")
             tensors = dict(model.named_parameters())
-            for name, tensor in model.named_buffers():
-                tensors.setdefault(name, tensor)
-        if not tensors or any(tensor.dtype != torch.bfloat16 for tensor in tensors.values()):
-            raise ValueError("Weight synchronization requires BF16 resident parameters and buffers")
+            hybrid = getattr(model, "sampling_vocab_size", None) is not None
+            if not hybrid:
+                for name, tensor in model.named_buffers():
+                    tensors.setdefault(name, tensor)
+        if not tensors or any(
+            tensor.dtype != (torch.float32 if hybrid and name.endswith((".A_log", ".dt_bias")) else torch.bfloat16)
+            for name, tensor in tensors.items()
+        ):
+            raise ValueError("Expected BF16 rollout weights (FP32 for hybrid GDN A_log and dt_bias)")
         core = physical_core(os.environ["NEURON_RT_VISIBLE_CORES"], 0)
         store = control_store(topology)
         endpoint = NixlEndpoint(
@@ -231,8 +236,11 @@ class NeuronWorkerExtension:
                 tensors.setdefault(name, tensor)
             checksums = {}
             for name in names if names is not None else sorted(tensors):
-                if name in tensors:
-                    host = tensors[name].detach().to("cpu").to(torch.float64)
+                resident = name
+                if name.startswith("model.") and name not in tensors:
+                    resident = "language_model." + name.removeprefix("model.")
+                if resident in tensors:
+                    host = tensors[resident].detach().to("cpu").to(torch.float64)
                     checksums[name] = [host.sum().item(), host.abs().sum().item()]
             return checksums
 
@@ -250,6 +258,16 @@ class NeuronWorkerExtension:
     def monkey_patch_model(self, vocab_size, banned_token_ids=None):
         """Implement verl's token restrictions using compiled native mask inputs."""
         runner = self.model_runner
+        if getattr(runner, "model", None) is not None:
+            with resident_weight_model(self):
+                model = runner.model
+            if hasattr(model, "sampling_vocab_size"):
+                if (model.sampling_vocab_size, model.suppressed_token_ids) != (
+                    vocab_size,
+                    tuple(sorted(set(banned_token_ids or ()))),
+                ):
+                    raise ValueError("Qwen3.8 token restrictions differ from the compiled sampling policy")
+                return
         if not runner.neuron_config.enable_structured_outputs:
             raise RuntimeError("Native vocabulary masking requires enable_structured_outputs before compilation")
         if runner.use_async_scheduling or getattr(runner, "lm_head_dp_size", 1) != 1:

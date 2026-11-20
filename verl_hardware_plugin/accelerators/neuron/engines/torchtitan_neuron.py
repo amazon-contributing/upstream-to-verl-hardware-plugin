@@ -43,6 +43,8 @@ def native_config_overrides(hf_config, optimizer_config=None, parallel_dims=None
     """Scope Neuron defaults to construction of this worker's TorchTitan trainer."""
     from torchtitan.models import qwen3
 
+    hybrid = getattr(hf_config, "model_type", None) in {"qwen3_5", "qwen3_5_text"}
+
     original_registry = qwen3.model_registry
 
     def model_registry(*args, **kwargs):
@@ -72,6 +74,22 @@ def native_config_overrides(hf_config, optimizer_config=None, parallel_dims=None
             partial(titan_impl.OptimizersContainer.Config, implementation="for-loop"),
         ),
     ]
+    if hybrid:
+        from torchtitan.models import qwen3_5
+        from torchtitan_neuron.models.qwen3_8 import from_hf_config
+
+        # The pinned verl builder resolves a core module and calls its registry.
+        # Restrict the substitution to construction of this worker's trainer.
+        overrides.extend(
+            [
+                (titan_impl, "derive_torchtitan_name_and_flavor", lambda config: ("qwen3_5", "27B")),
+                (
+                    qwen3_5,
+                    "model_registry",
+                    lambda flavor, *, attn_backend: from_hf_config(hf_config, attn_backend=attn_backend),
+                ),
+            ]
+        )
     if parallel_dims is not None:
         overrides.append((titan_impl.Trainer, "init_distributed", lambda trainer: parallel_dims))
     saved = []
@@ -96,15 +114,16 @@ class TorchTitanNeuronEngineWithLMHead(TorchTitanEngineWithLMHead):
     ):
         if not isinstance(engine_config, NeuronTorchtitanEngineConfig):
             raise ValueError("Use the NeuronTorchtitanEngineConfig overlay for actor and reference engines")
-        if model_config.hf_config.model_type != "qwen3":
-            raise ValueError("Trainium v1 supports dense Qwen3 only")
+        if model_config.hf_config.model_type not in {"qwen3", "qwen3_5", "qwen3_5_text"}:
+            raise ValueError("Trainium supports dense Qwen3 and the Qwen3.8-27B text decoder")
+        text = getattr(model_config.hf_config, "text_config", model_config.hf_config)
         if model_config.use_remove_padding:
             raise ValueError("Trainium causal SDPA requires model.use_remove_padding=false")
         for field in ("num_attention_heads", "num_key_value_heads", "vocab_size", "intermediate_size"):
-            if getattr(model_config.hf_config, field) % engine_config.tensor_parallel_size:
+            if getattr(text, field) % engine_config.tensor_parallel_size:
                 raise ValueError(f"Trainium requires {field} divisible by tensor_parallel_size")
         if engine_config.use_torch_compile:
-            configure_torch_compile_for_neuron(2 * model_config.hf_config.num_hidden_layers + 8)
+            configure_torch_compile_for_neuron(2 * text.num_hidden_layers + 8)
         parallel_dims = None
         if engine_config.forward_only and _actor_engine is not None:
             dimensions = (
@@ -195,19 +214,46 @@ class TorchTitanNeuronEngineWithLMHead(TorchTitanEngineWithLMHead):
                 )
         return loss, {"model_output": detach_tree(model_output), "loss": loss.detach().item(), "metrics": metrics}
 
-    def hf_parameters(self):
+    def _native_parameters(self):
         params = {}
         for module in self.module:
             params.update(module.state_dict())
-        converted = self._to_hf_named_params(params)
+        return params
+
+    def _qwen_export(self):
+        from .qwen_export import QwenTextExport
+
+        if self.model_config.hf_config.model_type in {"qwen3_5", "qwen3_5_text"}:
+            return QwenTextExport(self._native_parameters(), self.checkpointer.sd_adapter)
+        return None
+
+    def hf_parameters(self):
+        converted = self._to_hf_named_params(self._native_parameters())
+        if self.model_config.hf_config.model_type in {"qwen3_5", "qwen3_5_text"}:
+            converted = {
+                name.replace("model.language_model.", "model.", 1)
+                if name.startswith("model.language_model.")
+                else name: value
+                for name, value in converted.items()
+            }
         if self.model_config.hf_config.tie_word_embeddings:
             converted["lm_head.weight"] = converted["model.embed_tokens.weight"]
         return dict(sorted(converted.items()))
 
     def weight_sync_metadata(self):
+        if exporter := self._qwen_export():
+            return exporter.metadata()
         return [(name, tuple(value.shape), "bfloat16") for name, value in self.hf_parameters().items()]
 
+    def weight_sync_probes(self, names):
+        if exporter := self._qwen_export():
+            return dict(exporter.tensors(names))
+        parameters = self.hf_parameters()
+        return {name: parameters[name] for name in names}
+
     def get_per_tensor_param(self, **kwargs):
+        if exporter := self._qwen_export():
+            return exporter.tensors(), None
         cpu_threshold = self.engine_config.weight_sync_cpu_gather_threshold_bytes
 
         def tensors():

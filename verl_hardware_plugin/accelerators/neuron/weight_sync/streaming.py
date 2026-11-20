@@ -7,7 +7,7 @@ import torch
 
 
 def iter_weight_buckets(named_tensors, buckets, device):
-    """Stream CPU or device tensors into bounded device buffers."""
+    """Stream CPU or device tensors into bounded buffers on the staging device."""
     iterator = iter(named_tensors)
     current_name, current_tensor = None, None
     for bucket in buckets:
@@ -22,6 +22,8 @@ def iter_weight_buckets(named_tensors, buckets, device):
                     raise ValueError(f"Export does not match weight schedule at {entry.name}")
                 if current_tensor.dtype != torch.bfloat16:
                     raise ValueError(f"Export {entry.name} must use bfloat16")
+                if buffer.device.type == "cpu":
+                    current_tensor = current_tensor.to("cpu")
                 current_tensor = current_tensor.reshape(-1)
             buffer[entry.offset : entry.offset + entry.numel].copy_(
                 current_tensor[entry.param_offset : entry.param_offset + entry.numel]

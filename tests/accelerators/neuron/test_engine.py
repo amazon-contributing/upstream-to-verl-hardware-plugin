@@ -180,7 +180,7 @@ def test_nixl_bridge_refuses_cpu_fallback(monkeypatch):
 
 
 def test_weight_schedule_uses_bfloat16():
-    engine = SimpleNamespace(hf_parameters=lambda: {"model.norm.weight": torch.ones(4)})
+    engine = SimpleNamespace(_qwen_export=lambda: None, hf_parameters=lambda: {"model.norm.weight": torch.ones(4)})
     schedule = TorchTitanNeuronEngineWithLMHead.weight_sync_metadata(engine)
     assert schedule == [("model.norm.weight", (4,), "bfloat16")]
 
@@ -205,6 +205,7 @@ def test_weight_export_gathers_bfloat16_without_mutating_master_weights(cpu_thre
     # A large FP32 gather is the failure this export must avoid.
     sharded.full_tensor.side_effect = AssertionError("FP32 weight gather exceeds runtime limits")
     engine = SimpleNamespace(
+        _qwen_export=lambda: None,
         hf_parameters=lambda: {"lm_head.weight": sharded, "model.norm.weight": master},
         engine_config=SimpleNamespace(weight_sync_cpu_gather_threshold_bytes=cpu_threshold),
     )
@@ -226,3 +227,29 @@ def test_weight_export_gathers_bfloat16_without_mutating_master_weights(cpu_thre
         assert value.is_contiguous() and not value.requires_grad
     torch.testing.assert_close(master, original, rtol=0, atol=0)
     assert master.dtype == torch.float32 and master.requires_grad
+
+
+def test_qwen_wire_matches_titan_adapter_and_does_not_fetch_unrelated_weights():
+    from torchtitan.models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
+
+    from verl_hardware_plugin.accelerators.neuron.engines.qwen_export import QwenTextExport
+
+    adapter = Qwen35StateDictAdapter(SimpleNamespace(vision_encoder=None, enable_weight_tying=False), None)
+    data = {"norm.weight": torch.arange(8).float(), "layers.0.attention_norm.weight": torch.ones(8)}
+    for rank, part in enumerate("qkv", 1):
+        rows = 2 if part != "v" else 6
+        for member, shape in (("in_proj", (rows, 8)), ("conv", (rows, 1, 4))):
+            data[f"layers.0.attn.{member}_{part}.weight"] = torch.full(shape, rank + 0.125)
+    expected = {k.replace("model.language_model.", "model.", 1): v.bfloat16() for k, v in adapter.to_hf(data).items()}
+
+    class ReadAudit(dict):
+        def __getitem__(self, key):
+            reads.append(key)
+            return super().__getitem__(key)
+
+    reads = []
+    exporter = QwenTextExport(ReadAudit(data), adapter)
+    assert dict(exporter.tensors(["model.norm.weight"])).keys() == {"model.norm.weight"}
+    assert reads == ["norm.weight"]
+    assert exporter.metadata() == [(k, tuple(expected[k].shape), "bfloat16") for k in sorted(expected)]
+    torch.testing.assert_close(dict(exporter.tensors()), expected, rtol=0, atol=0)

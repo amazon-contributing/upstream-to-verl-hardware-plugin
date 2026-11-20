@@ -51,13 +51,12 @@ class NeuronNixlCheckpointEngine(CheckpointEngine):
         if self.verify_weights:
             from torch.distributed.tensor import DTensor
 
-            parameters = self.engine.hf_parameters()
-            for name in (
+            names = (
                 "model.norm.weight",
                 "model.layers.0.input_layernorm.weight",
                 "model.layers.0.post_attention_layernorm.weight",
-            ):
-                parameter = parameters[name]
+            )
+            for name, parameter in self.engine.weight_sync_probes(names).items():
                 if isinstance(parameter, DTensor):
                     parameter = parameter.full_tensor()
                 host = parameter.detach().to(torch.bfloat16).to("cpu").to(torch.float64)
@@ -129,14 +128,37 @@ class NeuronNixlCheckpointEngine(CheckpointEngine):
         buckets = plan_buckets(self.schedule, bucket_bytes=self.bucket_size)
         shapes = {name: shape for name, shape, dtype in self.schedule}
         plans = {}
+        host_slots = {}
+        # GDN projections produce many differently strided TP boxes. Packing
+        # each box on Trainium compiles different slice/transpose graphs for
+        # hundreds of buckets. Stage on the host as in the 27B reference run;
+        # the actual NIXL transfer still uses the registered HBM region.
+        pack_on_host = any(name.endswith(".linear_attn.conv1d.weight") for name in shapes)
         for key, endpoint in self.endpoints.items():
             plans[key] = [
                 plan_box(bucket, shapes, self.inventories[key], key[1], self.spec.rollout_tp) for bucket in buckets
             ]
             validate_box_coverage(plans[key], self.inventories[key])
             endpoint.register(slot_numel_for(plans[key]))
+            if pack_on_host:
+                host_slots[key] = torch.empty_like(endpoint.buffer, device="cpu")
         torch.distributed.barrier(group=self.export_group)
-        for index, buffer in enumerate(iter_weight_buckets(weights, buckets, self.device)):
+        # Stage before slicing as well as before packing. Slicing into a
+        # device bucket still compiles a graph for each distinct row offset.
+        buffer_device = "cpu" if pack_on_host else self.device
+        shared = pack_on_host and getattr(
+            getattr(getattr(self, "engine", None), "engine_config", None), "weight_sync_shared_host_bucket", False
+        )
+        if shared:
+            from .shared_export import SharedExport
+
+            exporter = self.engine._qwen_export()
+            if not hasattr(self, "shared_export"):
+                self.shared_export = SharedExport(exporter, buckets[0].buf_numel, self.export_group)
+            stream = self.shared_export.buckets(exporter, buckets)
+        else:
+            stream = iter_weight_buckets(weights, buckets, buffer_device)
+        for index, buffer in enumerate(stream):
             if self.rank == 0:
                 logger.info("neuron_nixl completing export bucket %d/%d", index + 1, len(buckets))
             synchronize()
@@ -144,7 +166,10 @@ class NeuronNixlCheckpointEngine(CheckpointEngine):
             for key, endpoint in self.endpoints.items():
                 plan = plans[key][index]
                 if plan.numel:
-                    pack_box(endpoint.buffer, buffer, buckets[index], plan)
+                    destination = host_slots[key] if pack_on_host else endpoint.buffer
+                    pack_box(destination, buffer, buckets[index], plan)
+                    if pack_on_host:
+                        endpoint.buffer.copy_(destination)
                     endpoint.push(plan.numel)
             torch.distributed.barrier(group=self.export_group)
             if self.rank == 0:

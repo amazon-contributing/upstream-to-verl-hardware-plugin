@@ -5,6 +5,7 @@
 
 import asyncio
 import importlib
+import os
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest import mock
@@ -62,20 +63,20 @@ def test_rollout_environment_does_not_autoload_training_backend(neuron_vllm):
     assert environment["TORCH_DEVICE_BACKEND_AUTOLOAD"] == "0"
     assert environment["VERL_NEURON_PROCESS_ROLE"] == "rollout"
     assert environment["VLLM_NEURON_BACKEND"] == "neuron_native"
-    assert environment["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+    assert "VLLM_USE_V2_MODEL_RUNNER" not in environment
 
 
 @pytest.mark.parametrize(
     "neuron_config", [{}, {"on_device_sampling_config": None}, {"on_device_sampling_config": {"max_top_k": 256}}]
 )
 def test_server_translates_ray_core_allocation_for_vllm_children(monkeypatch, neuron_vllm, neuron_config):
-    import os
-
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setenv("NEURON_RT_VISIBLE_CORES", "6,7")
     monkeypatch.setenv("NEURON_VISIBLE_DEVICES", "0,1")
     instance = object.__new__(neuron_vllm.NeuronVLLMHttpServer)
     kwargs = {"additional_config": {"neuron_config": neuron_config}}
     instance._preprocess_engine_kwargs(kwargs)
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "0"
     assert "NEURON_RT_VISIBLE_CORES" not in os.environ
     assert os.environ["NEURON_VISIBLE_DEVICES"] == "6,7"
     assert kwargs["distributed_executor_backend"] == "mp"
@@ -162,3 +163,29 @@ def test_update_advances_only_after_all_workers_apply_and_verify(neuron_vllm):
     assert instance.global_steps == 1
     assert result["neuron_nixl/verified_replicated_parameters"] == 1
     instance.engine.reset_prefix_cache.assert_awaited_once()
+
+
+def test_qwen35_rollout_configures_v2_device_sampling_before_compile(monkeypatch, neuron_vllm):
+    from verl.workers.rollout import utils
+
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    monkeypatch.delenv("TORCH_CACHING_PRECOMPILE", raising=False)
+    monkeypatch.delenv("VLLM_NEURON_DISABLE_PARALLEL_TRACE", raising=False)
+
+    instance = object.__new__(neuron_vllm.NeuronVLLMHttpServer)
+    instance.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="qwen3_5"), tokenizer=list(range(31)), processor=object()
+    )
+    monkeypatch.setattr(utils, "get_vision_placeholder_token_ids", lambda processor: [17, 18])
+    kwargs = {"additional_config": {"neuron_config": {"num_seqs_buckets": [1, 2]}}}
+    instance._preprocess_engine_kwargs(kwargs)
+    assert kwargs["hf_overrides"] == {
+        "architectures": ["Qwen3_5ForCausalLM"],
+        "sampling_vocab_size": 31,
+        "suppressed_token_ids": [17, 18],
+    }
+    assert kwargs["additional_config"]["neuron_config"] == {
+        "num_seqs_buckets": [1, 2],
+        "on_device_sampling_config": {"sampling_vocab_size": 31, "suppressed_token_ids": [17, 18]},
+    }
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"

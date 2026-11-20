@@ -108,3 +108,81 @@ def test_config_accepts_tensor_parallelism(tensor_parallel_size):
 
     config = NeuronTorchtitanEngineConfig(tensor_parallel_size=tensor_parallel_size)
     assert config.tensor_parallel_size == tensor_parallel_size
+
+
+def _check_qwen_export(rank, rendezvous):
+    from types import SimpleNamespace
+
+    from verl_hardware_plugin.accelerators.neuron.engines.qwen_export import QwenTextExport
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
+    try:
+        mesh = init_device_mesh("cpu", (2,))
+        state, refs = {}, {}
+        for index, part in enumerate("qkv"):
+            rows = 4 if part != "v" else 12
+            for member, tail in (("in_proj", (8,)), ("conv", (1, 4))):
+                shape = (rows, *tail)
+                full = torch.arange(torch.Size(shape).numel()).float().view(shape) + 0.125 + index * 256
+                name = f"layers.0.attn.{member}_{part}.weight"
+                state[name] = DTensor.from_local(full.chunk(2)[rank].contiguous(), mesh, [Shard(0)])
+                refs[name] = full
+        exporter = QwenTextExport(state, SimpleNamespace(from_hf_map={}))
+        got = dict(exporter.tensors())
+        for member, wire in (("in_proj", "in_proj_qkv"), ("conv", "conv1d")):
+            want = torch.cat([refs[f"layers.0.attn.{member}_{p}.weight"] for p in "qkv"]).bfloat16()
+            torch.testing.assert_close(got[f"model.layers.0.linear_attn.{wire}.weight"], want, rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_gather_gdn_components_before_fusing_tp_shards(tmp_path):
+    mp.spawn(_check_qwen_export, args=(f"file://{tmp_path / 'export'}",), nprocs=2, join=True)
+
+
+def _check_shared_export(rank, rendezvous):
+    from types import SimpleNamespace
+
+    from torch.distributed.tensor import Replicate, distribute_tensor
+    from torch.distributed.tensor.placement_types import _StridedShard
+
+    from verl_hardware_plugin.accelerators.neuron.engines.qwen_export import QwenTextExport
+    from verl_hardware_plugin.accelerators.neuron.weight_sync.shared_export import SharedExport
+    from verl_hardware_plugin.accelerators.neuron.weight_sync.streaming import iter_weight_buckets
+    from verl_hardware_plugin.accelerators.neuron.weight_sync.weight_layout import plan_buckets
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4)
+    try:
+        mesh = init_device_mesh("cpu", (2, 2))
+        state = {}
+        for i, part in enumerate("qkv"):
+            shape = (24 if part == "v" else 8, 7)
+            data = torch.arange(torch.Size(shape).numel()).float().view(shape) / 32 + 1000 * i
+            state[f"layers.0.attn.in_proj_{part}.weight"] = distribute_tensor(
+                data, mesh, (_StridedShard(0, split_factor=2), Shard(0))
+            )
+        norm = torch.tensor([0.125, -0.25, 0.5])
+        state["norm.weight"] = distribute_tensor(norm, mesh, (Shard(0), Replicate()))
+        state["fc.weight"] = distribute_tensor(torch.arange(77).float().view(11, 7), mesh, (Shard(0), Shard(1)))
+        exporter = QwenTextExport(
+            state, SimpleNamespace(from_hf_map={"model.norm.weight": "norm.weight", "lm_head.weight": "fc.weight"})
+        )
+        buckets = plan_buckets(exporter.metadata(), bucket_bytes=84)
+        shared = SharedExport(exporter, buckets[0].buf_numel, dist.group.WORLD)
+        for epoch in (1, 2):
+            with torch.no_grad():
+                for v in state.values():
+                    v.to_local().add_(epoch / 4)
+            ref = iter_weight_buckets(exporter.tensors(), buckets, "cpu")
+            for bucket, expected, actual in zip(buckets, ref, shared.buckets(exporter, buckets), strict=True):
+                dist.barrier()
+                for e in bucket.entries:
+                    sl = slice(e.offset, e.offset + e.numel)
+                    torch.testing.assert_close(actual[sl], expected[sl], rtol=0, atol=0)
+                dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_shared_host_export_matches_full_dtensor_after_update(tmp_path):
+    mp.spawn(_check_shared_export, args=(f"file://{tmp_path / 'shared'}",), nprocs=4, join=True)

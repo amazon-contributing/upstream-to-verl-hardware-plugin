@@ -227,7 +227,10 @@ def test_export_ranks_cannot_advance_past_sender(checkpoint_engine, monkeypatch)
 
 
 @pytest.mark.parametrize("tp_rank", range(4))
-def test_sync_transfers_only_resident_weights_and_skips_empty_buckets(checkpoint_engine, monkeypatch, tp_rank):
+@pytest.mark.parametrize("recurrent", [False, True])
+def test_sync_transfers_only_resident_weights_and_skips_empty_buckets(
+    checkpoint_engine, monkeypatch, tp_rank, recurrent
+):
     monkeypatch.setattr(checkpoint_engine, "synchronize", lambda: None)
     monkeypatch.setattr(torch.distributed, "barrier", lambda **kwargs: None)
     weights = {
@@ -235,12 +238,16 @@ def test_sync_transfers_only_resident_weights_and_skips_empty_buckets(checkpoint
         "other.weight": torch.arange(48, dtype=torch.bfloat16).reshape(4, 12),
         "norm.weight": torch.arange(4, dtype=torch.bfloat16),
     }
-    schedule = [(name, tuple(tensor.shape), "bfloat16") for name, tensor in weights.items()]
     tensors = {
         "linear_weight": torch.full((4, 3), torch.nan, dtype=torch.bfloat16),
         "other_weight": torch.full((3, 4), torch.nan, dtype=torch.bfloat16),
         "norm.weight": torch.full((4,), torch.nan, dtype=torch.bfloat16),
     }
+    conv = "model.layers.0.linear_attn.conv1d.weight"
+    if recurrent:
+        weights[conv] = torch.arange(16, dtype=torch.bfloat16).reshape(4, 1, 4)
+        tensors[conv] = torch.full((1, 1, 4), torch.nan, dtype=torch.bfloat16)
+    schedule = [(name, tuple(tensor.shape), "bfloat16") for name, tensor in weights.items()]
     inventory = {name: tuple(tensor.shape) for name, tensor in tensors.items()}
     payloads = deque()
     sizes = []
@@ -291,7 +298,9 @@ def test_sync_transfers_only_resident_weights_and_skips_empty_buckets(checkpoint
         assert not payloads
         assert 0 < len(sizes) < bucket_count
         assert len(set(sizes)) > 1
-        assert sum(sizes) == sum(tensor.numel() for tensor in tensors.values()) == 28
+        assert sum(sizes) == sum(tensor.numel() for tensor in tensors.values())
+        if recurrent:
+            torch.testing.assert_close(tensors[conv], updated[conv].chunk(4, dim=0)[tp_rank])
         torch.testing.assert_close(tensors["linear_weight"], updated["linear.weight"].chunk(4, dim=0)[tp_rank].T)
         torch.testing.assert_close(tensors["other_weight"], updated["other.weight"].chunk(4, dim=1)[tp_rank].T)
         torch.testing.assert_close(tensors["norm.weight"], updated["norm.weight"])

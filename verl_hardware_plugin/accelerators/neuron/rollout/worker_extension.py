@@ -262,6 +262,9 @@ class NeuronWorkerExtension:
             with resident_weight_model(self):
                 model = runner.model
             if hasattr(model, "sampling_vocab_size"):
+                sampling = runner.neuron_config.on_device_sampling_config
+                if sampling is None or sampling.all_greedy or sampling.deterministic or sampling.max_top_k < 1:
+                    raise ValueError("Qwen3.8 rollout requires stochastic on-device sampling with a positive max_top_k")
                 if (model.sampling_vocab_size, model.suppressed_token_ids) != (
                     vocab_size,
                     tuple(sorted(set(banned_token_ids or ()))),

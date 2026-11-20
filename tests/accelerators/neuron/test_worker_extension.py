@@ -96,6 +96,26 @@ def test_worker_installs_idempotent_native_mask_hooks(incompatible_hook):
         NeuronWorkerExtension.monkey_patch_model(worker, 6)
 
 
+@pytest.mark.parametrize("override", [{}, {"all_greedy": True}, {"deterministic": True}, {"max_top_k": 0}, None])
+def test_hybrid_worker_checks_the_compiled_sampler(override):
+    model = SimpleNamespace(sampling_vocab_size=7, suppressed_token_ids=(1, 6))
+    sampling = (
+        None
+        if override is None
+        else SimpleNamespace(**({"all_greedy": False, "deterministic": False, "max_top_k": 256} | override))
+    )
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(model=model, neuron_config=SimpleNamespace(on_device_sampling_config=sampling))
+    )
+    if override != {}:
+        with pytest.raises(ValueError, match="stochastic on-device"):
+            NeuronWorkerExtension.monkey_patch_model(worker, 7, [6, 1])
+        return
+    NeuronWorkerExtension.monkey_patch_model(worker, 7, [6, 1])
+    with pytest.raises(ValueError, match="restrictions differ"):
+        NeuronWorkerExtension.monkey_patch_model(worker, 7, [1])
+
+
 def test_worker_rejects_graphs_without_mask_input():
     worker = SimpleNamespace(
         model_runner=SimpleNamespace(neuron_config=SimpleNamespace(enable_structured_outputs=False))

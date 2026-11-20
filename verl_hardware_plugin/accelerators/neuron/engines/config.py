@@ -16,6 +16,10 @@ class NeuronTorchtitanEngineConfig(TorchtitanEngineConfig):
     spmd_backend: str = "default"
     max_seq_len: int = 1024
     activation_checkpoint: str = "none"
+    enable_sequence_parallel: bool = False
+    # The fused wqkv state-dict hook gathers each layer's full wqkv on every rank; disable for large models.
+    fuse_qkv: bool = True
+    log_prob_chunk_size: int = 2048
 
     def __post_init__(self):
         EngineConfig.__post_init__(self)
@@ -27,9 +31,11 @@ class NeuronTorchtitanEngineConfig(TorchtitanEngineConfig):
         for field in dimensions:
             if getattr(self, field) != 1:
                 raise ValueError(f"Trainium v1 requires {field}=1")
-        if self.param_offload or self.optimizer_offload or self.offload_policy or self.use_remove_padding:
-            raise ValueError("Trainium v1 does not support offload or packed inputs")
+        if self.param_offload or self.offload_policy or self.use_remove_padding:
+            raise ValueError("Trainium v1 does not support parameter offload or packed inputs")
         if self.max_seq_len is None or self.max_seq_len <= 0 or self.max_seq_len % 512:
             raise ValueError("Trainium max_seq_len must be a positive multiple of 512")
         if self.dtype != "bfloat16":
             raise ValueError("Trainium v1 requires dtype=bfloat16")
+        if not isinstance(self.log_prob_chunk_size, int) or self.log_prob_chunk_size < 0:
+            raise ValueError("log_prob_chunk_size must be a nonnegative integer")

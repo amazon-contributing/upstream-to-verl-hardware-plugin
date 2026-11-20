@@ -3,8 +3,10 @@
 
 """Bounded BF16 HF buckets and dense native vLLM tensor-parallel layouts."""
 
+import hashlib
+import json
 import re
-from dataclasses import dataclass
+from dataclasses import astuple, dataclass
 from math import prod
 
 import torch
@@ -43,7 +45,7 @@ class BoxPlan:
     skipped: tuple
 
 
-def plan_buckets(schedule, itemsize=2, *, bucket_bytes, whole_params=True):
+def plan_buckets(schedule, itemsize=2, *, bucket_bytes, whole_params=False):
     """whole_params starts a new bucket rather than split a weight that fits in one, so pieces keep the
     same shapes across layers. Senders and receivers must use the same setting.
     """
@@ -184,6 +186,15 @@ def plan_box(bucket, shapes, inventory, tp_rank, tp_size):
             pieces.append(BoxPiece(target, destination, offset, length, entry_index, source, transpose))
             offset += length
     return BoxPlan(tuple(pieces), offset, tuple(skipped))
+
+
+def layout_digest(buckets, plans):
+    """Fingerprint the ordered BF16 source slices and TP destinations, including empty buckets."""
+    digest = hashlib.sha256()
+    for bucket, plan in zip(buckets, plans, strict=True):
+        record = json.dumps((astuple(bucket), astuple(plan)), separators=(",", ":"))
+        digest.update(record.encode("utf-8") + b"\n")
+    return digest.hexdigest()
 
 
 def slot_numel_for(plans, itemsize=2):

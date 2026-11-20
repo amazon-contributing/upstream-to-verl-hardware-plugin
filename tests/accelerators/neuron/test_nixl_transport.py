@@ -5,6 +5,7 @@
 
 import asyncio
 import importlib
+import json
 import sys
 from collections import deque
 from types import ModuleType, SimpleNamespace
@@ -15,7 +16,12 @@ import torch
 
 from verl_hardware_plugin.accelerators.neuron.rollout.worker_extension import NeuronWorkerExtension
 from verl_hardware_plugin.accelerators.neuron.weight_sync import nixl_transport
-from verl_hardware_plugin.accelerators.neuron.weight_sync.nixl_transport import NixlEndpoint, NixlTopology, slot_address
+from verl_hardware_plugin.accelerators.neuron.weight_sync.nixl_transport import (
+    LAYOUT_PROTOCOL,
+    NixlEndpoint,
+    NixlTopology,
+    slot_address,
+)
 
 
 def test_transport_refuses_cpu_and_cpu_slot():
@@ -182,9 +188,12 @@ def test_nixl_topology_is_local_and_assigns_every_replica(checkpoint_engine):
         "host": "localhost",
         "port": 12345,
         "timeout_s": 30,
+        "layout_protocol": LAYOUT_PROTOCOL,
+        "whole_params": True,
         "checksums": {},
     }
-    metadata = [actor, actor.copy(), {"rollout_tp": 2}, {"rollout_tp": 2}]
+    replica = {"rollout_tp": 2, "layout_protocol": LAYOUT_PROTOCOL}
+    metadata = [actor, actor.copy(), replica, replica.copy()]
     trainer, rollout = checkpoint_engine.NeuronNixlCheckpointEngine.build_topology(2, 2, metadata)
     assert len(trainer["spec"]) == 2
     assert rollout["replica_index"] == [0, 1]
@@ -195,7 +204,17 @@ def test_nixl_topology_is_local_and_assigns_every_replica(checkpoint_engine):
         "rollout_tp": 2,
         "replicas": 2,
         "replica": 1,
+        "whole_params": True,
     }
+    for peer in metadata:
+        del peer["layout_protocol"]
+        with pytest.raises(ValueError, match="upgrade actor and rollout"):
+            checkpoint_engine.NeuronNixlCheckpointEngine.build_topology(2, 2, metadata)
+        peer["layout_protocol"] = LAYOUT_PROTOCOL
+    metadata[1]["whole_params"] = False
+    with pytest.raises(ValueError, match="disagree on the NIXL bucket layout"):
+        checkpoint_engine.NeuronNixlCheckpointEngine.build_topology(2, 2, metadata)
+    metadata[1]["whole_params"] = True
     metadata[-1]["rollout_tp"] = 4
     with pytest.raises(ValueError, match="same TP"):
         checkpoint_engine.NeuronNixlCheckpointEngine.build_topology(2, 2, metadata)
@@ -204,7 +223,6 @@ def test_nixl_topology_is_local_and_assigns_every_replica(checkpoint_engine):
 def test_export_ranks_cannot_advance_past_sender(checkpoint_engine, monkeypatch):
     events = []
     group = object()
-    monkeypatch.setattr(checkpoint_engine, "plan_buckets", lambda *args, **kwargs: [object(), object()])
 
     def buffers(*args):
         for index in range(2):
@@ -220,7 +238,7 @@ def test_export_ranks_cannot_advance_past_sender(checkpoint_engine, monkeypatch)
 
     monkeypatch.setattr(torch.distributed, "barrier", barrier)
     instance = SimpleNamespace(
-        connected=True, schedule=[], bucket_size=8, endpoints={}, export_group=group, device="cpu", rank=1
+        connected=True, buckets=[object(), object()], plans={}, endpoints={}, export_group=group, device="cpu", rank=1
     )
     asyncio.run(checkpoint_engine.NeuronNixlCheckpointEngine.send_weights(instance, []))
     assert events == ["barrier", "export-0", "sync", "barrier", "barrier", "export-1", "sync", "barrier", "barrier"]
@@ -262,32 +280,32 @@ def test_sync_transfers_only_resident_weights_and_skips_empty_buckets(checkpoint
         receiver.buffer[: payload.numel()].copy_(payload)
         return apply(receiver.buffer)
 
+    buckets = checkpoint_engine.plan_buckets(schedule, bucket_bytes=32)
+    shapes = {name: tensor.shape for name, tensor in weights.items()}
+    plans = [checkpoint_engine.plan_box(b, shapes, inventory, tp_rank, 4) for b in buckets]
     sender.register = lambda numel: register(sender, numel)
     sender.push = push
     receiver.register = lambda numel: register(receiver, numel)
     receiver.receive = receive
     engine = SimpleNamespace(
         connected=True,
-        schedule=schedule,
-        bucket_size=32,
+        buckets=buckets,
         endpoints={(0, tp_rank): sender},
-        inventories={(0, tp_rank): inventory},
+        plans={(0, tp_rank): plans},
         spec=SimpleNamespace(rollout_tp=4),
         export_group=object(),
         device="cpu",
         rank=1,
     )
     worker = SimpleNamespace(
-        _weight_sync_state=SimpleNamespace(
-            endpoint=receiver, inventory=inventory, tensors=tensors, rank=tp_rank, size=4
-        )
+        rank=tp_rank, _weight_sync_state=SimpleNamespace(endpoint=receiver, tensors=tensors, plans=plans)
     )
-    bucket_count = len(checkpoint_engine.plan_buckets(schedule, bucket_bytes=32))
+    bucket_count = len(buckets)
     for step in range(2):
         updated = {name: tensor + 100 * step for name, tensor in weights.items()}
         sizes.clear()
         asyncio.run(checkpoint_engine.NeuronNixlCheckpointEngine.send_weights(engine, updated.items()))
-        NeuronWorkerExtension.weight_sync_recv(worker, schedule, 32)
+        NeuronWorkerExtension.weight_sync_recv(worker)
         assert not payloads
         assert 0 < len(sizes) < bucket_count
         assert len(set(sizes)) > 1
@@ -306,20 +324,75 @@ def test_nixl_fanout_assigns_every_receiver_once(checkpoint_engine, monkeypatch,
         return object()
 
     monkeypatch.setattr(checkpoint_engine, "control_store", control_store)
+    schedule = [("norm.weight", (4,), "bfloat16")]
+    shapes = {"norm.weight": (4,)}
+    buckets = checkpoint_engine.plan_buckets(schedule, bucket_bytes=32)
+    plans = [checkpoint_engine.plan_box(b, shapes, shapes, 0, rollout_tp) for b in buckets]
+    report = json.dumps([shapes, checkpoint_engine.layout_digest(buckets, plans)])
     monkeypatch.setattr(
-        checkpoint_engine, "NixlEndpoint", lambda *args, **kwargs: SimpleNamespace(store=Mock(get=lambda key: b"{}"))
+        checkpoint_engine, "NixlEndpoint", lambda *a, **kw: SimpleNamespace(store=Mock(get=lambda k: report))
     )
-    spec = SimpleNamespace(replicas=replicas, rollout_tp=rollout_tp, timeout_s=30)
+    spec = SimpleNamespace(replicas=replicas, rollout_tp=rollout_tp, timeout_s=30, whole_params=False)
     ownership = []
     loads = []
     for rank in range(world_size):
         instance = SimpleNamespace(
-            rank=rank, world_size=world_size, connected=False, endpoints={}, inventories={}, device="neuron", core=rank
+            rank=rank,
+            world_size=world_size,
+            connected=False,
+            endpoints={},
+            plans={},
+            device="neuron",
+            core=rank,
+            schedule=schedule,
+            bucket_size=32,
         )
-        checkpoint_engine.NeuronNixlCheckpointEngine.init_process_group(instance, spec)
+        checkpoint_engine.NeuronNixlCheckpointEngine.init_process_group(instance, spec, LAYOUT_PROTOCOL)
         assert instance.connected
         ownership.extend(instance.endpoints)
         loads.append(len(instance.endpoints))
     assert sorted(ownership) == [(replica, rank) for replica in range(replicas) for rank in range(rollout_tp)]
     assert max(loads) - min(loads) <= 1
     assert stores == [True, *([False] * (world_size - 1))]
+
+
+@pytest.mark.parametrize("actor_whole,rollout_whole", [(False, True), (True, False), (False, False), (True, True)])
+def test_connect_checks_slice_layout_before_registering_memory(
+    checkpoint_engine, monkeypatch, actor_whole, rollout_whole
+):
+    shapes = {"a.weight": (4, 4), "b.weight": (4, 4), "c.weight": (8, 4)}
+    schedule = [(k, v, "bfloat16") for k, v in shapes.items()]
+    spec = NixlTopology("localhost", 1, 1, 1, 1, whole_params=actor_whole)
+    endpoint = Mock()
+    # Both policies produce three buckets and the same registered slot size.
+    remote_buckets = checkpoint_engine.plan_buckets(schedule, bucket_bytes=48, whole_params=rollout_whole)
+    remote_plans = [checkpoint_engine.plan_box(b, shapes, shapes, 0, 1) for b in remote_buckets]
+    assert len(remote_plans) == 3
+    endpoint.store.get.return_value = json.dumps(
+        [shapes, checkpoint_engine.layout_digest(remote_buckets, remote_plans)]
+    )
+    actor = SimpleNamespace(
+        connected=False,
+        rank=0,
+        world_size=1,
+        endpoints={},
+        plans={},
+        device="neuron",
+        core=0,
+        master_store=object(),
+        bucket_size=48,
+        schedule=schedule,
+    )
+    monkeypatch.setattr(checkpoint_engine, "NixlEndpoint", lambda *a, **kw: endpoint)
+    connect = checkpoint_engine.NeuronNixlCheckpointEngine.init_process_group
+    with pytest.raises(ValueError, match="layout protocol"):
+        connect(actor, spec)  # A controller without protocol negotiation.
+    if actor_whole == rollout_whole:
+        connect(actor, spec, LAYOUT_PROTOCOL)
+        assert actor.connected and actor.plans[0, 0] == remote_plans
+    else:
+        with pytest.raises(ValueError, match="layout mismatch for replica 0, TP rank 0"):
+            connect(actor, spec, LAYOUT_PROTOCOL)
+        assert not actor.connected
+    endpoint.register.assert_not_called()
+    endpoint.push.assert_not_called()

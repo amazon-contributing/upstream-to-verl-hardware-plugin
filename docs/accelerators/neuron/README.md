@@ -249,6 +249,17 @@ trainer:
 YAML
 ```
 
+Use the same hardware-plugin build for the controller, actors, rollout servers and TP
+workers. At connection time each sender checks the rollout worker's ordered BF16
+weight layout, including its TP slices and destination offsets, before registering
+memory or writing any weights. Workers without the layout handshake cannot join.
+
+By default the exporter fills each bucket as in the stable recipe. To start a fresh
+bucket for parameters that fit in one bucket, set
+`+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.neuron_nixl.whole_params=true`.
+This can reduce the number of shapes compiled for device packing, but can increase
+the number of transfers. The controller distributes the policy to every rollout.
+
 The training sequence length is `512 + 512 = 1024`. Keep
 `torchtitan.max_seq_len` equal to the prompt plus response limit and divisible by
 512 when changing these values. This backend uses fixed micro-batches and padded

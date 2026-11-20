@@ -18,7 +18,7 @@ import torch
 from ..runtime import physical_core
 from ..weight_sync.nixl_transport import NixlEndpoint, NixlTopology, control_store
 from ..weight_sync.streaming import validate_box_coverage
-from ..weight_sync.weight_layout import apply_box, plan_box, plan_buckets, slot_numel_for
+from ..weight_sync.weight_layout import apply_box, layout_digest, plan_box, plan_buckets, slot_numel_for
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +159,7 @@ def cpu_topk_topp(logits, generators, k, p, use_fp64_gumbel=False):
 
 
 class NeuronWorkerExtension:
-    def weight_sync_connect(self, spec):
+    def weight_sync_connect(self, spec, schedule, bucket_bytes):
         if getattr(self, "_weight_sync_state", None) is not None:
             raise RuntimeError("This worker already has a weight-sync connection")
         device = torch.device(self.device)
@@ -188,25 +188,24 @@ class NeuronWorkerExtension:
             timeout_s=topology.timeout_s,
         )
         inventory = {name: tuple(tensor.shape) for name, tensor in tensors.items()}
-        endpoint.store.set("inventory", json.dumps(inventory))
+        buckets = plan_buckets(schedule, bucket_bytes=bucket_bytes, whole_params=topology.whole_params)
+        shapes = {name: tuple(shape) for name, shape, dtype in schedule}
+        plans = [plan_box(bucket, shapes, inventory, rank, topology.rollout_tp) for bucket in buckets]
+        validate_box_coverage(plans, inventory)
+        endpoint.store.set("inventory", json.dumps([inventory, layout_digest(buckets, plans)]))
         self._weight_sync_state = SimpleNamespace(
             endpoint=endpoint,
             tensors=tensors,
-            inventory=inventory,
-            rank=rank,
-            size=topology.rollout_tp,
+            plans=plans,
         )
         return {"tp_rank": rank, "n_params": len(tensors), "device": device.type}
 
-    def weight_sync_recv(self, schedule, bucket_bytes):
+    def weight_sync_recv(self):
         state = getattr(self, "_weight_sync_state", None)
         if state is None:
             raise RuntimeError("Connect the weight-sync receiver before receiving weights")
         started = time.monotonic()
-        buckets = plan_buckets(schedule, bucket_bytes=bucket_bytes)
-        shapes = {name: tuple(shape) for name, shape, dtype in schedule}
-        plans = [plan_box(bucket, shapes, state.inventory, state.rank, state.size) for bucket in buckets]
-        validate_box_coverage(plans, state.inventory)
+        plans = state.plans
         state.endpoint.register(slot_numel_for(plans))
         applied = 0
         for plan in plans:
@@ -216,7 +215,7 @@ class NeuronWorkerExtension:
                 )
         logger.info(
             "neuron_nixl TP rank %d applied %d pieces of %d buckets in %.2fs",
-            state.rank,
+            self.rank,
             applied,
             len(plans),
             time.monotonic() - started,

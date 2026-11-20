@@ -16,6 +16,7 @@ from verl.workers.rollout.replica import RolloutMode
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
 
 from ..runtime import CoreLease
+from ..weight_sync.nixl_transport import LAYOUT_PROTOCOL
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -140,22 +141,30 @@ class NeuronVLLMHttpServer(vLLMHttpServer):
 
     async def execute_checkpoint_engine(self, method, **kwargs):
         if method == "prepare":
-            return {"role": "rollout", "rollout_tp": self.config.tensor_model_parallel_size}
+            return {
+                "role": "rollout",
+                "rollout_tp": self.config.tensor_model_parallel_size,
+                "layout_protocol": LAYOUT_PROTOCOL,
+            }
         if method == "finalize":
             return None
         if method != "init_process_group":
             raise ValueError(f"Unsupported checkpoint operation {method}")
-        spec, schedule = kwargs["spec"], kwargs["schedule"]
+        if kwargs.get("layout_protocol") != LAYOUT_PROTOCOL:
+            raise ValueError("Incompatible NIXL layout protocol; upgrade actor and rollout workers together")
+        spec, schedule, bucket_bytes = kwargs["spec"], kwargs["schedule"], kwargs["bucket_bytes"]
         self._sync_checksums = kwargs["checksums"]
         if getattr(self, "_sync_connected", False):
-            if spec != self._sync_spec or schedule != self._sync_schedule:
+            if spec != self._sync_spec or schedule != self._sync_schedule or bucket_bytes != self._sync_bucket_bytes:
                 raise ValueError("NIXL topology and weight metadata must remain stable")
             return
         self._sync_spec = spec
         self._sync_schedule = schedule
-        self._sync_bucket_bytes = kwargs["bucket_bytes"]
+        self._sync_bucket_bytes = bucket_bytes
         rpc_spec = spec.receiver(kwargs["replica_index"])
-        results = await self.collective_rpc("weight_sync_connect", timeout=spec.timeout_s, args=(rpc_spec,))
+        results = await self.collective_rpc(
+            "weight_sync_connect", timeout=spec.timeout_s, args=(rpc_spec, schedule, bucket_bytes)
+        )
         expected = set(range(self.config.tensor_model_parallel_size))
         if {item["tp_rank"] for item in results} != expected or any(item["device"] == "cpu" for item in results):
             raise RuntimeError("Every rollout TP worker must connect a real Trainium NIXL endpoint")
@@ -170,7 +179,6 @@ class NeuronVLLMHttpServer(vLLMHttpServer):
         results = await self.collective_rpc(
             "weight_sync_recv",
             timeout=self._sync_spec.timeout_s,
-            args=(self._sync_schedule, self._sync_bucket_bytes),
         )
         if len(results) != self.config.tensor_model_parallel_size or any(count <= 0 for count in results):
             raise RuntimeError("At least one TP worker did not apply the NIXL update")

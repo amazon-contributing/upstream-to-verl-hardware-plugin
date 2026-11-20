@@ -119,8 +119,8 @@ def test_fused_bias_layout_and_incomplete_qkv_are_rejected_or_mapped():
 
 def test_whole_params_close_a_bucket_rather_than_split_a_weight_that_fits():
     schedule = [("a", (4, 4), "bfloat16"), ("b", (4, 4), "bfloat16"), ("c", (8, 4), "bfloat16")]
-    buckets = plan_buckets(schedule, bucket_bytes=48)
+    buckets = plan_buckets(schedule, bucket_bytes=48, whole_params=True)
     layout = [[(entry.name, entry.numel) for entry in bucket.entries] for bucket in buckets]
     assert layout == [[("a", 16)], [("b", 16), ("c", 8)], [("c", 24)]]
-    greedy = plan_buckets(schedule, bucket_bytes=48, whole_params=False)
+    greedy = plan_buckets(schedule, bucket_bytes=48)
     assert [[(entry.name, entry.numel) for entry in bucket.entries] for bucket in greedy][0] == [("a", 16), ("b", 8)]

@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def qwen35_rollout(model_config):
+    hf = getattr(model_config, "hf_config", None)
+    return getattr(hf, "model_type", None) in {"qwen3_5", "qwen3_5_text"}
+
+
 def serving_environment():
     environment = {
         "VERL_PLATFORM": "aws",
@@ -29,7 +34,6 @@ def serving_environment():
         "VLLM_PLUGINS": "neuron",
         "VLLM_NEURON_BACKEND": "neuron_native",
         "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-        "VLLM_USE_V2_MODEL_RUNNER": "0",
         "NEURON_RT_MAP_HBM": "1",
         "NEURON_RT_ENABLE_P2P": "0",
         "FI_EFA_ENABLE_SHM_TRANSFER": "0",
@@ -96,6 +100,22 @@ class NeuronVLLMHttpServer(vLLMHttpServer):
             async_scheduling=False,
             compilation_config={"cudagraph_mode": "NONE"},
         )
+        # The Ray replica receives an unresolved DictConfig. Only the HTTP
+        # server has loaded HFModelConfig, and its MP workers inherit this env.
+        hybrid = qwen35_rollout(getattr(self, "model_config", None))
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if hybrid else "0"
+        if hybrid:
+            os.environ["TORCH_CACHING_PRECOMPILE"] = "0"
+            os.environ["VLLM_NEURON_DISABLE_PARALLEL_TRACE"] = "1"
+            from verl.workers.rollout.utils import get_vision_placeholder_token_ids
+
+            hf = engine_kwargs.setdefault("hf_overrides", {})
+            hf.update(
+                architectures=["Qwen3_5ForCausalLM"],
+                sampling_vocab_size=len(self.model_config.tokenizer),
+                suppressed_token_ids=get_vision_placeholder_token_ids(self.model_config.processor) or [],
+            )
+            return
         # Return logits from Neuron and use vLLM's host sampler. The pinned
         # device sampler silently caps candidates even when top_k=-1.
         engine_kwargs.setdefault("additional_config", {}).setdefault("neuron_config", {}).update(
@@ -169,7 +189,9 @@ class NeuronVLLMHttpServer(vLLMHttpServer):
         started = time.monotonic()
         results = await self.collective_rpc(
             "weight_sync_recv",
-            timeout=self._sync_spec.timeout_s,
+            # This RPC streams the entire model. Individual NIXL transfers
+            # and acknowledgements already enforce the per-operation timeout.
+            timeout=None,
             args=(self._sync_schedule, self._sync_bucket_bytes),
         )
         if len(results) != self.config.tensor_model_parallel_size or any(count <= 0 for count in results):

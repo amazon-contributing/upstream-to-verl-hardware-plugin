@@ -51,7 +51,8 @@ def plan_buckets(schedule, itemsize=2, *, bucket_bytes):
     used = 0
     for name, shape, dtype in schedule:
         shape = tuple(shape)
-        if name in names or dtype != "bfloat16" or len(shape) not in (1, 2) or min(shape) < 1:
+        convolution = len(shape) == 3 and name.endswith(".linear_attn.conv1d.weight")
+        if name in names or dtype != "bfloat16" or (len(shape) not in (1, 2) and not convolution) or min(shape) < 1:
             raise ValueError(f"Unsupported or duplicate BF16 weight schedule entry: {name}")
         names.add(name)
         row_size = prod(shape[1:])
@@ -116,7 +117,43 @@ def _fused_region(name, shapes, inventory, rank, size):
     return target, region, origin, transposed
 
 
+def _gdn_regions(name, shapes, inventory, rank, size):
+    """Map each per-head slice independently: [q|k|v|z] or convolution [q|k|v]."""
+    match = re.fullmatch(r"(.*[.]linear_attn[.])(in_proj_qkv|in_proj_z|conv1d)[.]weight", name)
+    if not match:
+        return None
+    prefix, member = match.groups()
+    conv = member == "conv1d"
+    target = prefix + ("conv1d_weight" if conv else "in_proj_qkvz_weight")
+    if target not in inventory:
+        return None
+    qkv = shapes[prefix + "in_proj_qkv.weight"]
+    z = shapes[prefix + "in_proj_z.weight"]
+    key, remainder = divmod(qkv[0] - z[0], 2)
+    value = z[0]
+    if remainder or key <= 0 or key % size or value % size:
+        raise ValueError(f"Incompatible grouped-head dimensions for {target}")
+    tail = tuple(shapes[name][1:])
+    local_k, local_v = key // size, value // size
+    resident = (2 * local_k + local_v, *tail) if conv else (qkv[1], 2 * (local_k + local_v))
+    if tuple(inventory[target]) != resident:
+        raise ValueError(f"Expected resident shape {resident} for {target}")
+    bands = [(0, local_k, 0), (key, local_k, local_k), (2 * key, local_v, 2 * local_k)]
+    if member == "in_proj_z":
+        bands = [(0, local_v, 2 * local_k + local_v)]
+    regions = []
+    for base, width, dst in bands:
+        start = base + rank * width
+        region = ((start, start + width),) + tuple((0, dim) for dim in tail)
+        origin = (dst, 0, 0) if conv else (0, dst)
+        regions.append((target, region, origin, not conv))
+    return regions
+
+
 def _target_regions(name, shapes, inventory, rank, size):
+    gdn = _gdn_regions(name, shapes, inventory, rank, size)
+    if gdn is not None:
+        return gdn
     fused = _fused_region(name, shapes, inventory, rank, size)
     if fused is not None:
         return [fused]
@@ -151,6 +188,14 @@ def _target_regions(name, shapes, inventory, rank, size):
 def plan_box(bucket, shapes, inventory, tp_rank, tp_size):
     if tp_size < 1 or not 0 <= tp_rank < tp_size:
         raise ValueError("Invalid tensor-parallel coordinate")
+    # Normalize the VLM decoder prefix once per bucket, retaining the original
+    # wire entries and offsets. lm_head is outside the decoder on both sides.
+    hybrid = any(key.startswith("language_model.") for key in inventory)
+
+    def resident_name(name):
+        return "language_model." + name[6:] if hybrid and name.startswith("model.") else name
+
+    resident_shapes = {resident_name(name): shape for name, shape in shapes.items()} if hybrid else shapes
     pieces, skipped = [], []
     offset = 0
     for entry_index, entry in enumerate(bucket.entries):
@@ -158,7 +203,7 @@ def plan_box(bucket, shapes, inventory, tp_rank, tp_size):
             raise ValueError(f"Bucket shape disagrees with schedule for {entry.name}")
         row_size = prod(entry.shape[1:])
         first, last = entry.param_offset // row_size, (entry.param_offset + entry.numel) // row_size
-        targets = _target_regions(entry.name, shapes, inventory, tp_rank, tp_size)
+        targets = _target_regions(resident_name(entry.name), resident_shapes, inventory, tp_rank, tp_size)
         if not targets:
             skipped.append(entry.name)
         for target, region, origin, transpose in targets:
@@ -214,7 +259,7 @@ def apply_box(host_buffer, plan, tensors):
                 for (start, end), extent in zip(piece.dst_box[1:], target.shape[1:], strict=True)
             )
             if target.device.type == "cpu" or rows_only:
-                target[_slices(piece.dst_box)].copy_(source)
+                target[_slices(piece.dst_box)].copy_(source.to(target.dtype))
             else:
                 staged = target.detach().to("cpu")
                 staged[_slices(piece.dst_box)].copy_(source)

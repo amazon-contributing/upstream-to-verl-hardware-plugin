@@ -18,6 +18,8 @@ class NeuronTorchtitanEngineConfig(TorchtitanEngineConfig):
     activation_checkpoint: str = "none"
     # Zero disables host gathering; otherwise applies to full BF16 export size.
     weight_sync_cpu_gather_threshold_bytes: int = 0
+    # All actor ranks must share one /dev/shm mount. Rollout may be remote.
+    weight_sync_shared_host_bucket: bool = False
 
     def __post_init__(self):
         EngineConfig.__post_init__(self)

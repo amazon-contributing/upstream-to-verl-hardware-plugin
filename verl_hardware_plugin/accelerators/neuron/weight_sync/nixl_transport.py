@@ -150,8 +150,10 @@ class NixlEndpoint:
         if "FI_EFA_IFACE" not in os.environ:
             os.environ["FI_EFA_IFACE"] = efa_interface(core)
         agent_type, config_type = import_nixl(lite=lite)
+        # A sender and its paired receiver share the store prefix and can have
+        # the same PID in separate containers. NIXL identifies peers by name.
         self.agent = agent_type(
-            f"verl-{os.getpid()}-{prefix}",
+            f"verl-{prefix}-{'tx' if sender else 'rx'}-{os.getpid()}",
             config_type(enable_prog_thread=True, enable_listen_thread=False, listen_port=0, backends=["LIBFABRIC"]),
         )
         if "LIBFABRIC" not in self.agent.backends:

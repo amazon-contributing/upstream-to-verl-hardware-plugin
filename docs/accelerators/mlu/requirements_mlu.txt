@@ -23,7 +23,7 @@ TransferQueue==0.1.11
 
 accelerate==1.14.0
 click==8.2.1
-datasets==4.0.0
+datasets==5.0.1
 mathruler
 qwen_vl_utils
 transformers==5.15.0 # support Qwen3.5

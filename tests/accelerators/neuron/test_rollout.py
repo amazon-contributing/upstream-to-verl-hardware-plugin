@@ -176,7 +176,11 @@ def test_qwen35_rollout_configures_v2_device_sampling_before_compile(monkeypatch
         hf_config=SimpleNamespace(model_type="qwen3_5"), tokenizer=list(range(31)), processor=object()
     )
     monkeypatch.setattr(utils, "get_vision_placeholder_token_ids", lambda processor: [17, 18])
-    kwargs = {"additional_config": {"neuron_config": {"num_seqs_buckets": [1, 2]}}}
+    kwargs = {
+        "additional_config": {
+            "neuron_config": {"num_seqs_buckets": [1, 2], "on_device_sampling_config": {"max_top_k": 128}}
+        }
+    }
     instance._preprocess_engine_kwargs(kwargs)
     assert kwargs["hf_overrides"] == {
         "architectures": ["Qwen3_5ForCausalLM"],
@@ -185,6 +189,6 @@ def test_qwen35_rollout_configures_v2_device_sampling_before_compile(monkeypatch
     }
     assert kwargs["additional_config"]["neuron_config"] == {
         "num_seqs_buckets": [1, 2],
-        "on_device_sampling_config": {"sampling_vocab_size": 31, "suppressed_token_ids": [17, 18]},
+        "on_device_sampling_config": {"max_top_k": 128},
     }
     assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"

@@ -115,14 +115,6 @@ class NeuronVLLMHttpServer(vLLMHttpServer):
                 sampling_vocab_size=len(self.model_config.tokenizer),
                 suppressed_token_ids=get_vision_placeholder_token_ids(self.model_config.processor) or [],
             )
-            config = engine_kwargs.setdefault("additional_config", {}).setdefault("neuron_config", {})
-            sampling = config.setdefault("on_device_sampling_config", {})
-            if sampling is not None:
-                # The shared native sampler reads its policy here. Releases with
-                # the Qwen-specific sampler read the same policy from HF overrides.
-                sampling.update(
-                    sampling_vocab_size=hf["sampling_vocab_size"], suppressed_token_ids=hf["suppressed_token_ids"]
-                )
             return
         # Return logits from Neuron and use vLLM's host sampler. The pinned
         # device sampler silently caps candidates even when top_k=-1.

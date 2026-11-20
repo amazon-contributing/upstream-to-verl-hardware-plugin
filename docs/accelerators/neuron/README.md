@@ -263,6 +263,14 @@ Trainium. `update_weights_bucket_megabytes` controls the bucket size. Remove
 We use CPU sampling because vLLM-Neuron's current on-device sampler limits
 sampling to at most 256 candidates, even with `top_k: -1`.
 
+For a TP8/FSDP8 actor placed on all 64 logical NeuronCores of a Trainium2
+node, set `VERL_NEURON_ACTOR_CORE_ORDER=tp8_fsdp8` in every actor worker's
+environment. Before selecting a device, each consecutive group of 64 actor
+ranks checks its actual Ray node IDs and exclusive core leases. A 64-rank
+group split across nodes or sharing those cores cannot enable this mapping.
+Leave the variable unset for the example above and other partial-node allocations; each
+worker then keeps the core assigned by Ray.
+
 ### Launch and inspect the run
 
 ```bash

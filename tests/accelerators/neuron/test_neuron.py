@@ -4,6 +4,7 @@
 """CPU tests for native Trainium adapters; no accelerator allocation is required."""
 
 import ast
+import asyncio
 from contextvars import Context
 from pathlib import Path
 from types import SimpleNamespace
@@ -122,20 +123,67 @@ def test_tp8_fsdp8_core_order_places_groups_on_supported_devices():
         actor_core("tp4", 0)
 
 
-def test_worker_applies_core_order_only_on_full_nodes(monkeypatch):
+def test_worker_applies_core_order_only_after_verification(monkeypatch):
     import os
 
-    monkeypatch.setenv("VERL_NEURON_ACTOR_CORE_ORDER", "tp8_fsdp8")
-    monkeypatch.setenv("NEURON_RT_VISIBLE_CORES", "13")
-    monkeypatch.setenv("RANK", str(64 + 13))  # rank 13 of the second actor node
-    monkeypatch.setenv("RAY_LOCAL_WORLD_SIZE", "64")
-    prepare_worker_environment()
-    from verl_hardware_plugin.accelerators.neuron.runtime import actor_core
+    from verl_hardware_plugin.accelerators.neuron import runtime
 
-    assert os.environ["NEURON_RT_VISIBLE_CORES"] == str(actor_core("tp8_fsdp8", 13))
-    monkeypatch.setenv("RAY_LOCAL_WORLD_SIZE", "8")
+    monkeypatch.setenv(runtime.ACTOR_CORE_ORDER, "tp8_fsdp8")
+    monkeypatch.setenv("NEURON_RT_VISIBLE_CORES", "32")
+    monkeypatch.setenv("RANK", "77")
+    monkeypatch.setenv("WORLD_SIZE", "128")
+    monkeypatch.setenv("RAY_LOCAL_WORLD_SIZE", "64")
+    monkeypatch.setenv("WG_PREFIX", "trainer")
+    monkeypatch.setenv("MASTER_ADDR", "localhost")
+    monkeypatch.setenv("MASTER_PORT", "8000")
+
+    def fail_verification(group, rank):
+        assert (group, rank) == ("trainer:localhost:8000", 77)
+        raise ValueError("invalid leases")
+
+    monkeypatch.setattr(runtime, "_verify_actor_core_leases", fail_verification)
+    with pytest.raises(ValueError, match="invalid leases"):
+        prepare_worker_environment()
+    assert os.environ["NEURON_RT_VISIBLE_CORES"] == "32"
+
+    monkeypatch.setattr(runtime, "_verify_actor_core_leases", lambda group, rank: None)
+    prepare_worker_environment()
+    assert os.environ["NEURON_RT_VISIBLE_CORES"] == str(runtime.actor_core("tp8_fsdp8", 13))
+
+    # A split pool's local world size still describes its parent.
+    monkeypatch.setenv("WORLD_SIZE", "16")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("NEURON_RT_VISIBLE_CORES", "32")
     with pytest.raises(ValueError, match="all 64 cores"):
         prepare_worker_environment()
+    assert os.environ["NEURON_RT_VISIBLE_CORES"] == "32"
+
+
+@pytest.mark.parametrize("placement", ["whole_node", "split_nodes", "duplicate_core", "partial_lease"])
+def test_core_order_requires_actual_exclusive_leases(placement):
+    from verl_hardware_plugin.accelerators.neuron.runtime import _ActorCoreLeases
+
+    async def verify():
+        verifier = _ActorCoreLeases()
+        # Ray can assign core IDs in any order. Only all 64 unique, exclusive
+        # leases of a single node authorize the group to permute its cores.
+        leases = [("node-a", [str((rank + 13) % 64)]) for rank in range(64)]
+        if placement == "split_nodes":
+            leases[32:] = [("node-b", ids) for _, ids in leases[32:]]
+        elif placement == "duplicate_core":
+            leases[-1] = leases[0]
+        elif placement == "partial_lease":
+            leases[-1] = ("node-a", [])
+        pending = [asyncio.create_task(verifier.verify(rank, *lease)) for rank, lease in enumerate(leases[:-1])]
+        await asyncio.sleep(0)
+        assert not any(call.done() for call in pending)
+        results = await asyncio.gather(*pending, verifier.verify(63, *leases[-1]), return_exceptions=True)
+        if placement == "whole_node":
+            assert results == [None] * 64
+        else:
+            assert all(isinstance(result, ValueError) for result in results)
+
+    asyncio.run(verify())
 
 
 @pytest.mark.parametrize("visible,rank,expected", [("7", 0, 7), ("4-7", 2, 6), ("2,6", 1, 6)])

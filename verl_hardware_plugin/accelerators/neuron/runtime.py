@@ -3,6 +3,7 @@
 
 """Process setup shared by Ray workers and torchrun entry points."""
 
+import asyncio
 import functools
 import importlib
 import importlib.abc
@@ -162,6 +163,62 @@ def actor_core(order, node_rank):
     return device * 4 + tp_rank % 4
 
 
+class _ActorCoreLeases:
+    """One short-lived Ray rendezvous for a contiguous block of 64 actor ranks."""
+
+    def __init__(self):
+        self.leases = {}
+        self.ready = asyncio.Event()
+
+    async def verify(self, local_rank, node_id, cores):
+        lease = (node_id, tuple(cores))
+        if local_rank in self.leases:
+            raise ValueError(f"Ray actor rank {local_rank} registered its NeuronCore lease twice")
+        self.leases[local_rank] = lease
+        if len(self.leases) == CORES_PER_NODE:
+            self.ready.set()
+        await asyncio.wait_for(self.ready.wait(), timeout=300)
+        # A split verl pool can report its parent's RAY_LOCAL_WORLD_SIZE.
+        # Validate actual worker leases, not placement-group bundle counts.
+        nodes = {node for node, _ in self.leases.values()}
+        assigned = [ids for _, ids in self.leases.values()]
+        if (
+            len(nodes) != 1
+            or any(len(ids) != 1 for ids in assigned)
+            or {ids[0] for ids in assigned} != {str(i) for i in range(CORES_PER_NODE)}
+        ):
+            raise ValueError(f"{ACTOR_CORE_ORDER} requires distinct Ray leases for all 64 cores on one node")
+
+
+# An actor can initialize both actor and reference engines. Its Ray resource
+# reservation lasts for the worker's lifetime; do not make repeat calls wait
+# for peers which have already initialized.
+@functools.lru_cache(maxsize=1)
+def _verify_actor_core_leases(group, rank):
+    import ray
+
+    # Scope the rendezvous to this worker group and rank block. No actor rank
+    # gives up its Ray lease; the complete set stays reserved throughout training.
+    context = ray.get_runtime_context()
+    block, local_rank = divmod(rank, CORES_PER_NODE)
+    verifier = (
+        ray.remote(_ActorCoreLeases)
+        .options(
+            name=f"verl-neuron-leases:{context.get_job_id()}:{group}:{block}",
+            get_if_exists=True,
+            num_cpus=0,
+            scheduling_strategy="DEFAULT",
+        )
+        .remote()
+    )
+    ids = (
+        context.get_accelerator_ids().get("neuron_cores", [])
+        if context.get_assigned_resources().get("neuron_cores") == 1
+        else []
+    )
+    ray.get(verifier.verify.remote(local_rank, context.get_node_id(), ids), timeout=300)
+
+
 def prepare_worker_environment():
     """Preserve Ray's physical allocation while selecting local device zero."""
     configure_environment()
@@ -171,10 +228,13 @@ def prepare_worker_environment():
             raise RuntimeError("Ray did not assign NeuronCores to this training worker")
         order = os.environ.get(ACTOR_CORE_ORDER)
         if order:
-            if int(os.environ["RAY_LOCAL_WORLD_SIZE"]) != CORES_PER_NODE:
+            rank, size = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
+            if int(os.environ["RAY_LOCAL_WORLD_SIZE"]) != CORES_PER_NODE or size < 1 or size % CORES_PER_NODE:
                 raise ValueError(f"{ACTOR_CORE_ORDER} requires actor workers on all {CORES_PER_NODE} cores of a node")
-            node_rank = int(os.environ["RANK"]) % CORES_PER_NODE
-            os.environ["NEURON_RT_VISIBLE_CORES"] = str(actor_core(order, node_rank))
+            target = actor_core(order, rank % CORES_PER_NODE)
+            group = f"{os.environ['WG_PREFIX']}:{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}"
+            _verify_actor_core_leases(group, rank)
+            os.environ["NEURON_RT_VISIBLE_CORES"] = str(target)
         os.environ["LOCAL_RANK"] = "0"
         os.environ["LOCAL_WORLD_SIZE"] = os.environ["RAY_LOCAL_WORLD_SIZE"]
 

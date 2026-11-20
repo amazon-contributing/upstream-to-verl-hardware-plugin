@@ -254,6 +254,9 @@ def test_device_buckets_end_to_end(tmp_path):
                 "FI_EFA_ENABLE_SHM_TRANSFER": "0",
                 "NEURON_LOGICAL_NC_CONFIG": "2",
             }
+            if not actor:
+                # Standalone lite executors each own one core (vLLM sets this for its TP group).
+                env["NEURON_RT_ROOT_COMM_ID"] = f"127.0.0.1:{free_port()}"
             log = tmp_path / f"{role}-{rank}.log"
             with log.open("w") as output:
                 child = subprocess.Popen(

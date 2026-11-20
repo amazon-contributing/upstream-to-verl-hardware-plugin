@@ -33,6 +33,7 @@ def test_dense_tp_boxes_match_independent_full_tensor_oracle(tp_size, bucket_byt
         from importlib import import_module
 
         import_module("libtorch_neuronx_lite")
+    kernels = {}
     prefix = "model.layers.0.self_attn."
     shapes = {
         "model.embed_tokens.weight": (16, 8),
@@ -74,7 +75,7 @@ def test_dense_tp_boxes_match_independent_full_tensor_oracle(tp_size, bucket_byt
         actual = {name: torch.full_like(tensor, torch.nan, device=device) for name, tensor in expected.items()}
         for bucket, plan, buffer in zip(buckets, plans, reference_buckets(weights, buckets), strict=True):
             pack_box(slot, buffer, bucket, plan)
-            apply_box(slot, plan, actual)
+            apply_box(slot.to(device), plan, actual, kernels)
         for name in expected:
             torch.testing.assert_close(actual[name].cpu(), expected[name], rtol=0, atol=0)
 
@@ -114,7 +115,7 @@ def test_fused_bias_layout_and_incomplete_qkv_are_rejected_or_mapped():
     slot = torch.zeros(slot_numel_for(plans), dtype=torch.bfloat16)
     for bucket, plan, buffer in zip(buckets, plans, reference_buckets(weights, buckets), strict=True):
         pack_box(slot, buffer, bucket, plan)
-        apply_box(slot, plan, actual)
+        apply_box(slot, plan, actual, {})
     assert actual[prefix + "qkv_proj_bias"].tolist() == [4, 5, 6, 7, 2, 3, 2, 3]
     del shapes[prefix + "v_proj.bias"]
     with pytest.raises(ValueError, match="Incomplete QKV"):

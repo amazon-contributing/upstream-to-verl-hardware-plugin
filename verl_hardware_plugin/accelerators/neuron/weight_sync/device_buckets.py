@@ -79,6 +79,44 @@ def projection_rows(name, shape, config):
         yield name.replace(".wqkv.", f".w{kind}."), (heads * count, *shape[1:]), runs
 
 
+def hf_projections(shards, hf, from_hf_map):
+    """Describe each HF tensor by row runs in its native actor parameters."""
+    names = {native: hf_name for hf_name, native in from_hf_map.items() if native}
+    gdn = {}
+    for source, shard in shards.items():
+        name = source.replace("_orig_mod.", "").replace("_checkpoint_wrapped_module.", "")
+        if hf.tie_word_embeddings and name == "lm_head.weight":
+            continue  # plan_box maps the embedding to both resident destinations.
+        match = re.fullmatch(r"layers\.(\d+)\.attn\.(in_proj|conv)_([qkv])\.weight", name)
+        if match:
+            layer, member, part = match.groups()
+            fused = "conv1d" if member == "conv" else "in_proj_qkv"
+            parts = gdn.setdefault(f"model.layers.{layer}.linear_attn.{fused}.weight", {})
+            if part in parts:
+                raise ValueError(f"Duplicate GDN component {name}")
+            parts[part] = source
+            continue
+        for native, shape, row_runs in projection_rows(name, shard.shape, hf):
+            template = re.sub(r"(?<=layers\.)\d+", "{}", native)
+            layer = re.search(r"layers\.(\d+)", native)
+            hf_name = names[template].format(layer[1] if layer else "")
+            yield hf_name.replace("model.language_model.", "model.", 1), shape, {source: row_runs}
+
+    for name, parts in gdn.items():
+        if parts.keys() != set("qkv"):
+            raise ValueError(f"Incomplete GDN projection {name}")
+        tail = shards[parts["q"]].shape[1:]
+        offset, runs = 0, {}
+        for part in "qkv":
+            source = parts[part]
+            shape = shards[source].shape
+            if shape[1:] != tail:
+                raise ValueError(f"Incompatible GDN component shapes for {name}")
+            runs[source] = [(0, offset, shape[0])]
+            offset += shape[0]
+        yield name, (offset, *tail), runs
+
+
 @dataclass(frozen=True)
 class CopyRows:
     source: str
@@ -96,7 +134,7 @@ class CopyRows:
             source = source.clone()
         source = source.to(torch.bfloat16)
         if self.columns != self.width:
-            source = F.pad(source, (self.column, self.width - self.column - self.columns))
+            source = F.pad(source.reshape(self.rows, self.columns), (self.column, self.width - self.column - self.columns))
         buffer.narrow(0, self.offset, self.rows * self.width).copy_(source.reshape(-1))
 
 
@@ -117,7 +155,7 @@ def _bucket_copies(bucket, runs, owned):
                         end - begin,
                         entry.offset + (begin - first) * width,
                         width,
-                        shard.offsets[1] if len(shard.shape) == 2 else 0,
+                        shard.offsets[-1] if len(shard.shape) > 1 else 0,
                         prod(shard.sizes[1:]),
                     )
                 )
@@ -143,20 +181,16 @@ class DeviceBucketLayout:
 
     def __init__(self, metadata, rank, hf, from_hf_map, bucket_bytes):
         owned = owned_shards(metadata, rank)
-        names = {native: hf_name for hf_name, native in from_hf_map.items() if native}
+        shards = metadata[rank]
+        text = getattr(hf, "text_config", hf)
         shapes, runs = {}, {}
-        for source, shard in metadata[rank].items():
-            name = source.replace("_orig_mod.", "").replace("_checkpoint_wrapped_module.", "")
-            if hf.tie_word_embeddings and name == "lm_head.weight":
-                continue  # plan_box maps the embedding to both resident destinations.
-            for native, shape, row_runs in projection_rows(name, shard.shape, hf):
-                template = re.sub(r"(?<=layers\.)\d+", "{}", native)
-                layer = re.search(r"layers\.(\d+)", native)
-                hf_name = names[template].format(layer[1] if layer else "")
-                if hf_name in shapes:
-                    raise ValueError(f"Duplicate actor weight {hf_name}")
-                shapes[hf_name] = shape
-                runs[hf_name] = []
+        for hf_name, shape, sources in hf_projections(shards, text, from_hf_map):
+            if hf_name in shapes:
+                raise ValueError(f"Duplicate actor weight {hf_name}")
+            shapes[hf_name] = shape
+            runs[hf_name] = []
+            for source, row_runs in sources.items():
+                shard = shards[source]
                 if source not in owned:
                     continue
                 for native_row, hf_row, count in row_runs:

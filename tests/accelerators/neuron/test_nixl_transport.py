@@ -263,7 +263,7 @@ def test_sync_transfers_only_resident_weights_and_skips_empty_buckets(checkpoint
     )
     worker = SimpleNamespace(
         _weight_sync_state=SimpleNamespace(
-            endpoint=receiver, inventory=inventory, tensors=tensors, rank=tp_rank, size=4
+            endpoint=receiver, inventory=inventory, tensors=tensors, kernels={}, rank=tp_rank, size=4
         )
     )
     bucket_count = len(layout.buckets)

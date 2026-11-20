@@ -83,6 +83,8 @@ def native_config_overrides(
     """Scope Neuron defaults to construction of this worker's TorchTitan trainer."""
     from torchtitan.models import qwen3
 
+    hybrid = getattr(hf_config, "model_type", None) in {"qwen3_5", "qwen3_5_text"}
+
     original_registry = qwen3.model_registry
     original_layers = qwen3._build_qwen3_layers
 
@@ -122,6 +124,22 @@ def native_config_overrides(
             partial(titan_impl.OptimizersContainer.Config, implementation="for-loop"),
         ),
     ]
+    if hybrid:
+        from torchtitan.models import qwen3_5
+        from torchtitan_neuron.models.qwen3_8 import from_hf_config
+
+        # The pinned verl builder resolves a core module and calls its registry.
+        # Restrict the substitution to construction of this worker's trainer.
+        overrides.extend(
+            [
+                (titan_impl, "derive_torchtitan_name_and_flavor", lambda config: ("qwen3_5", "27B")),
+                (
+                    qwen3_5,
+                    "model_registry",
+                    lambda flavor, *, attn_backend: from_hf_config(hf_config, attn_backend=attn_backend),
+                ),
+            ]
+        )
     if parallel_dims is not None:
         overrides.append((titan_impl.Trainer, "init_distributed", lambda trainer: parallel_dims))
     saved = []
@@ -146,8 +164,9 @@ class TorchTitanNeuronEngineWithLMHead(TorchTitanEngineWithLMHead):
     ):
         if not isinstance(engine_config, NeuronTorchtitanEngineConfig):
             raise ValueError("Use the NeuronTorchtitanEngineConfig overlay for actor and reference engines")
-        if model_config.hf_config.model_type != "qwen3":
-            raise ValueError("Trainium v1 supports dense Qwen3 only")
+        if model_config.hf_config.model_type not in {"qwen3", "qwen3_5", "qwen3_5_text"}:
+            raise ValueError("Trainium supports dense Qwen3 and the Qwen3.8-27B text decoder")
+        text = getattr(model_config.hf_config, "text_config", model_config.hf_config)
         if model_config.use_remove_padding:
             raise ValueError("Trainium causal SDPA requires model.use_remove_padding=false")
         from ..runtime import ACTOR_CORE_ORDER
@@ -155,10 +174,10 @@ class TorchTitanNeuronEngineWithLMHead(TorchTitanEngineWithLMHead):
         if os.environ.get(ACTOR_CORE_ORDER) == "tp8_fsdp8" and engine_config.tensor_parallel_size != 8:
             raise ValueError(f"{ACTOR_CORE_ORDER}=tp8_fsdp8 places ranks for tensor_parallel_size=8 only")
         for field in ("num_attention_heads", "num_key_value_heads", "vocab_size", "intermediate_size"):
-            if getattr(model_config.hf_config, field) % engine_config.tensor_parallel_size:
+            if getattr(text, field) % engine_config.tensor_parallel_size:
                 raise ValueError(f"Trainium requires {field} divisible by tensor_parallel_size")
         if engine_config.use_torch_compile:
-            configure_torch_compile_for_neuron(2 * model_config.hf_config.num_hidden_layers + 8)
+            configure_torch_compile_for_neuron(2 * text.num_hidden_layers + 8)
         parallel_dims = None
         if engine_config.forward_only and _actor_engine is not None:
             dimensions = (

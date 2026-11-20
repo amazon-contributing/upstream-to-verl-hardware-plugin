@@ -296,3 +296,19 @@ RUN_DIR="$NEURON_EXAMPLE_DIR/runs/longer-$(date +%Y%m%d-%H%M%S)" \
   data.train_max_samples=-1 data.val_max_samples=32 \
   trainer.total_training_steps=20 trainer.test_freq=5
 ```
+
+### Qwen3.8-27B text rollout
+
+The 27B checkpoint uses the Hugging Face architecture IDs `qwen3_5` and
+`qwen3_5_text`. Its hybrid decoder needs more than the dense Qwen3
+dependencies in the example above: the trainer must provide
+`torchtitan_neuron.models.qwen3_8.from_hf_config`, and vLLM-Neuron must
+support the BF16 text model on Model Runner V2, including
+`sampling_vocab_size` and `suppressed_token_ids` overrides. The stock
+Neuron 2.33.1 packages alone do not provide that combination.
+
+For the 512-token GSM8K setup, use actor TP4 × FSDP8 and four TP8
+rollout replicas on one Trn2 host. Use padded inputs, disable prefix
+caching and chunked prefill, and set `rollout.top_k=256` for the V2
+on-device sampler. The NIXL sender assembles GDN projection and
+convolution slices from live actor shards in bounded Trainium buffers.

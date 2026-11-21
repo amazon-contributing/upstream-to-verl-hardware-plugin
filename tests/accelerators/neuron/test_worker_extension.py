@@ -43,7 +43,7 @@ def test_checksum_uses_unwrapped_parameter_names():
 def test_receiver_refuses_cpu_before_connecting_to_a_store():
     worker = SimpleNamespace(device="cpu")
     with pytest.raises(ValueError, match="real Trainium receiver"):
-        NeuronWorkerExtension.weight_sync_connect(worker, {})
+        NeuronWorkerExtension.weight_sync_connect(worker, {}, [], 32)
 
 
 @pytest.mark.parametrize("offset,expected", [(0, [True, False, True, True]), (4, [True, True, False, False])])

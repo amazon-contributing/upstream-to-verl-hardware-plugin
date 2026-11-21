@@ -7,9 +7,11 @@ import functools
 import importlib
 import importlib.abc
 import importlib.util
+import json
 import os
 import shlex
 import sys
+import time
 from pathlib import Path
 
 
@@ -144,6 +146,59 @@ def physical_core(visible, local_rank):
     return cores[local_rank]
 
 
+# Opt-in actor rank placement for TP=8 x FSDP=8 on a 64-core trn2 node. The default (rank r on core r)
+# puts each FSDP group on every other device, which the runtime cannot build collectives for.
+ACTOR_CORE_ORDER = "VERL_NEURON_ACTOR_CORE_ORDER"
+CORES_PER_NODE = 64
+_TP8_FSDP8_FIRST_DEVICES = (0, 3, 4, 7, 8, 11, 12, 15)
+
+
+def actor_core(order, node_rank):
+    if order != "tp8_fsdp8":
+        raise ValueError(f"Unknown {ACTOR_CORE_ORDER}: {order!r} (supported: tp8_fsdp8)")
+    if not 0 <= node_rank < CORES_PER_NODE:
+        raise ValueError(f"Node rank {node_rank} is outside a {CORES_PER_NODE}-core node")
+    group, tp_rank = divmod(node_rank, 8)
+    first = _TP8_FSDP8_FIRST_DEVICES[group]
+    device = first if tp_rank < 4 else first ^ 1
+    return device * 4 + tp_rank % 4
+
+
+def _check_actor_core_leases(leases):
+    # A split verl pool can report its parent's RAY_LOCAL_WORLD_SIZE, so check the actual leases.
+    nodes = {node for node, _ in leases}
+    if (
+        len(leases) != CORES_PER_NODE
+        or len(nodes) != 1
+        or any(len(ids) != 1 for _, ids in leases)
+        or {ids[0] for _, ids in leases} != {str(i) for i in range(CORES_PER_NODE)}
+    ):
+        raise ValueError(f"{ACTOR_CORE_ORDER} requires distinct Ray leases for all 64 cores on one node")
+
+
+# The actor and reference engines of one worker both call this; only the first waits for its peers.
+@functools.lru_cache(maxsize=1)
+def _verify_actor_core_leases(group, rank, timeout_s=300):
+    import ray
+    from ray.experimental import internal_kv
+
+    context = ray.get_runtime_context()
+    block, local_rank = divmod(rank, CORES_PER_NODE)
+    prefix = f"verl-neuron-leases:{context.get_job_id()}:{group}:{block}:"
+    ids = (
+        context.get_accelerator_ids().get("neuron_cores", [])
+        if context.get_assigned_resources().get("neuron_cores") == 1
+        else []
+    )
+    internal_kv._internal_kv_put(prefix + str(local_rank), json.dumps([context.get_node_id(), list(ids)]))
+    deadline = time.monotonic() + timeout_s
+    while len(keys := internal_kv._internal_kv_list(prefix)) < CORES_PER_NODE:
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"Only {len(keys)} of {CORES_PER_NODE} actor ranks reported their NeuronCore leases")
+        time.sleep(0.5)
+    _check_actor_core_leases([tuple(json.loads(internal_kv._internal_kv_get(key))) for key in keys])
+
+
 def prepare_worker_environment():
     """Preserve Ray's physical allocation while selecting local device zero."""
     configure_environment()
@@ -151,6 +206,15 @@ def prepare_worker_environment():
         visible = os.environ.get("NEURON_RT_VISIBLE_CORES", "")
         if not visible:
             raise RuntimeError("Ray did not assign NeuronCores to this training worker")
+        order = os.environ.get(ACTOR_CORE_ORDER)
+        if order:
+            rank, size = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
+            if int(os.environ["RAY_LOCAL_WORLD_SIZE"]) != CORES_PER_NODE or size < 1 or size % CORES_PER_NODE:
+                raise ValueError(f"{ACTOR_CORE_ORDER} requires actor workers on all {CORES_PER_NODE} cores of a node")
+            target = actor_core(order, rank % CORES_PER_NODE)
+            group = f"{os.environ['WG_PREFIX']}:{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}"
+            _verify_actor_core_leases(group, rank)
+            os.environ["NEURON_RT_VISIBLE_CORES"] = str(target)
         os.environ["LOCAL_RANK"] = "0"
         os.environ["LOCAL_WORLD_SIZE"] = os.environ["RAY_LOCAL_WORLD_SIZE"]
 

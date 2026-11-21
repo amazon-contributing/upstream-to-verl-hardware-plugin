@@ -14,6 +14,9 @@ from pathlib import Path
 
 import torch
 
+# Version 1 negotiates a concrete layout digest per sender/receiver at connection time.
+LAYOUT_PROTOCOL = 1
+
 
 @dataclass(frozen=True)
 class NixlTopology:
@@ -22,6 +25,7 @@ class NixlTopology:
     rollout_tp: int
     replicas: int
     timeout_s: float
+    whole_params: bool = False
 
     def receiver(self, replica):
         if not 0 <= replica < self.replicas:

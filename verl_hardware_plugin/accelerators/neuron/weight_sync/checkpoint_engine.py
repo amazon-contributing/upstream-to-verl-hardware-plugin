@@ -3,10 +3,10 @@
 
 """NIXL-only checkpoint bridge for native TorchTitan and native vLLM-Neuron."""
 
+import gc
 import json
 import logging
 import os
-import socket
 import time
 from datetime import timedelta
 
@@ -15,9 +15,9 @@ import torch
 from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry
 
 from ..runtime import physical_core
-from .nixl_transport import NixlEndpoint, NixlTopology, control_store, synchronize
+from .nixl_transport import LAYOUT_PROTOCOL, NixlEndpoint, NixlTopology, control_store, synchronize
 from .streaming import iter_weight_buckets, validate_box_coverage
-from .weight_layout import pack_box, plan_box, plan_buckets, slot_numel_for
+from .weight_layout import layout_digest, pack_box, plan_box, plan_buckets, slot_numel_for
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -25,7 +25,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 @CheckpointEngineRegistry.register("neuron_nixl")
 class NeuronNixlCheckpointEngine(CheckpointEngine):
-    def __init__(self, bucket_size, is_master=False, timeout_s=300, verify_weights=True, **kwargs):
+    def __init__(self, bucket_size, is_master=False, timeout_s=1800, verify_weights=True, whole_params=False, **kwargs):
         from ..engines.torchtitan_neuron import actor_engine
 
         self.engine = actor_engine()
@@ -34,19 +34,28 @@ class NeuronNixlCheckpointEngine(CheckpointEngine):
         self.bucket_size = int(bucket_size)
         self.timeout_s = float(timeout_s)
         self.verify_weights = bool(verify_weights)
+        if not isinstance(whole_params, bool):
+            raise ValueError("neuron_nixl whole_params must be a boolean")
+        self.whole_params = whole_params
         self.connected = False
         self.schedule = self.engine.weight_sync_metadata()
         self.rank = torch.distributed.get_rank()
         self.world_size = torch.distributed.get_world_size()
         self.device = self.engine.trainer.device
         self.core = physical_core(os.environ["NEURON_RT_VISIBLE_CORES"], int(os.environ.get("LOCAL_RANK", "0")))
-        self.endpoints, self.inventories = {}, {}
+        self.endpoints, self.plans = {}, {}
         self.export_group = torch.distributed.new_group(backend="gloo", timeout=timedelta(seconds=self.timeout_s))
 
     def prepare(self):
         import ray
 
-        metadata = {"role": "actor", "schedule": self.schedule, "bucket_size": self.bucket_size}
+        metadata = {
+            "role": "actor",
+            "schedule": self.schedule,
+            "bucket_size": self.bucket_size,
+            "whole_params": self.whole_params,
+            "layout_protocol": LAYOUT_PROTOCOL,
+        }
         checksums = {}
         if self.verify_weights:
             from torch.distributed.tensor import DTensor
@@ -64,11 +73,14 @@ class NeuronNixlCheckpointEngine(CheckpointEngine):
                 checksums[name] = [host.sum().item(), host.abs().sum().item()]
         metadata["checksums"] = checksums
         if self.rank == 0:
-            if not hasattr(self, "port"):
-                with socket.socket() as listener:
-                    listener.bind(("127.0.0.1", 0))
-                    self.port = listener.getsockname()[1]
-            metadata.update(host=ray.util.get_node_ip_address(), port=self.port, timeout_s=self.timeout_s)
+            host = ray.util.get_node_ip_address()
+            if getattr(self, "master_store", None) is None:
+                # Bind port 0 and keep the store: probing a free port and reopening it races.
+                self.master_store = control_store(
+                    NixlTopology(host, 0, rollout_tp=1, replicas=1, timeout_s=self.timeout_s), master=True
+                )
+                self.port = self.master_store.port
+            metadata.update(host=host, port=self.port, timeout_s=self.timeout_s)
         return metadata
 
     @classmethod
@@ -81,6 +93,10 @@ class NeuronNixlCheckpointEngine(CheckpointEngine):
             raise ValueError("Trainer ranks disagree on weight metadata")
         if any(item["bucket_size"] != master["bucket_size"] for item in actors):
             raise ValueError("Trainer ranks disagree on the NIXL bucket size")
+        if any(item.get("layout_protocol") != LAYOUT_PROTOCOL for item in metadata):
+            raise ValueError("Incompatible NIXL layout protocol; upgrade actor and rollout workers together")
+        if any(item["whole_params"] != master["whole_params"] for item in actors):
+            raise ValueError("Trainer ranks disagree on the NIXL bucket layout")
         degrees = {item["rollout_tp"] for item in replicas}
         if len(degrees) != 1:
             raise ValueError("All rollout replicas must use the same TP degree")
@@ -90,10 +106,12 @@ class NeuronNixlCheckpointEngine(CheckpointEngine):
             rollout_tp=degrees.pop(),
             timeout_s=master["timeout_s"],
             replicas=rollout_world_size,
+            whole_params=master["whole_params"],
         )
-        actor_args = {"spec": [spec] * actor_wg_world_size}
+        actor_args = {"spec": [spec] * actor_wg_world_size, "layout_protocol": [LAYOUT_PROTOCOL] * actor_wg_world_size}
         rollout_args = {
             "spec": [spec] * rollout_world_size,
+            "layout_protocol": [LAYOUT_PROTOCOL] * rollout_world_size,
             "schedule": [master["schedule"]] * rollout_world_size,
             "bucket_bytes": [master["bucket_size"]] * rollout_world_size,
             "replica_index": list(range(rollout_world_size)),
@@ -101,13 +119,18 @@ class NeuronNixlCheckpointEngine(CheckpointEngine):
         }
         return actor_args, rollout_args
 
-    def init_process_group(self, spec):
+    def init_process_group(self, spec, layout_protocol=None):
+        if layout_protocol != LAYOUT_PROTOCOL:
+            raise ValueError("Incompatible NIXL layout protocol; upgrade actor and rollout workers together")
         if self.connected:
             if self.spec != spec:
                 raise ValueError("NIXL topology cannot change during this run")
             return
         self.spec = spec
-        self.store = control_store(spec, master=self.rank == 0)
+        self.buckets = plan_buckets(self.schedule, bucket_bytes=self.bucket_size, whole_params=spec.whole_params)
+        shapes = {name: shape for name, shape, dtype in self.schedule}
+        store = getattr(self, "master_store", None) if self.rank == 0 else None
+        self.store = store if store is not None else control_store(spec, master=self.rank == 0)
         for replica in range(spec.replicas):
             for rank in range(spec.rollout_tp):
                 if (replica * spec.rollout_tp + rank) % self.world_size != self.rank:
@@ -117,23 +140,23 @@ class NeuronNixlCheckpointEngine(CheckpointEngine):
                     self.store, prefix, self.device, self.core, sender=True, timeout_s=spec.timeout_s
                 )
                 self.endpoints[replica, rank] = endpoint
-                self.inventories[replica, rank] = {
-                    name: tuple(shape) for name, shape in json.loads(endpoint.store.get("inventory")).items()
-                }
+                report = json.loads(endpoint.store.get("inventory"))
+                if not isinstance(report, list) or len(report) != 2:
+                    raise ValueError("Rollout worker did not supply a NIXL weight layout digest")
+                inventory, received_digest = report
+                plans = [plan_box(bucket, shapes, inventory, rank, spec.rollout_tp) for bucket in self.buckets]
+                validate_box_coverage(plans, inventory)
+                if layout_digest(self.buckets, plans) != received_digest:
+                    raise ValueError(f"NIXL weight layout mismatch for replica {replica}, TP rank {rank}")
+                self.plans[replica, rank] = plans
         self.connected = True
 
     async def send_weights(self, weights, global_steps=None):
         if not self.connected:
             raise RuntimeError("Connect both NIXL pools before sending weights")
         started = time.monotonic()
-        buckets = plan_buckets(self.schedule, bucket_bytes=self.bucket_size)
-        shapes = {name: shape for name, shape, dtype in self.schedule}
-        plans = {}
+        buckets, plans = self.buckets, self.plans
         for key, endpoint in self.endpoints.items():
-            plans[key] = [
-                plan_box(bucket, shapes, self.inventories[key], key[1], self.spec.rollout_tp) for bucket in buckets
-            ]
-            validate_box_coverage(plans[key], self.inventories[key])
             endpoint.register(slot_numel_for(plans[key]))
         torch.distributed.barrier(group=self.export_group)
         for index, buffer in enumerate(iter_weight_buckets(weights, buckets, self.device)):
@@ -154,6 +177,11 @@ class NeuronNixlCheckpointEngine(CheckpointEngine):
                     len(buckets),
                     self.spec.replicas * self.spec.rollout_tp,
                 )
+        # Nothing else frees the export's cached memory before the next actor forward.
+        del buffer
+        gc.collect()
+        if hasattr(torch, "neuron"):
+            torch.neuron.empty_cache()
         logger.info(
             "neuron_nixl rank %d exported %d HF buckets at policy step %s for %d TP receivers",
             self.rank,

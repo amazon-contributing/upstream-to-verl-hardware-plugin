@@ -3,14 +3,15 @@
 
 """Process setup shared by Ray workers and torchrun entry points."""
 
-import asyncio
 import functools
 import importlib
 import importlib.abc
 import importlib.util
+import json
 import os
 import shlex
 import sys
+import time
 from pathlib import Path
 
 
@@ -163,60 +164,39 @@ def actor_core(order, node_rank):
     return device * 4 + tp_rank % 4
 
 
-class _ActorCoreLeases:
-    """One short-lived Ray rendezvous for a contiguous block of 64 actor ranks."""
-
-    def __init__(self):
-        self.leases = {}
-        self.ready = asyncio.Event()
-
-    async def verify(self, local_rank, node_id, cores):
-        lease = (node_id, tuple(cores))
-        if local_rank in self.leases:
-            raise ValueError(f"Ray actor rank {local_rank} registered its NeuronCore lease twice")
-        self.leases[local_rank] = lease
-        if len(self.leases) == CORES_PER_NODE:
-            self.ready.set()
-        await asyncio.wait_for(self.ready.wait(), timeout=300)
-        # A split verl pool can report its parent's RAY_LOCAL_WORLD_SIZE.
-        # Validate actual worker leases, not placement-group bundle counts.
-        nodes = {node for node, _ in self.leases.values()}
-        assigned = [ids for _, ids in self.leases.values()]
-        if (
-            len(nodes) != 1
-            or any(len(ids) != 1 for ids in assigned)
-            or {ids[0] for ids in assigned} != {str(i) for i in range(CORES_PER_NODE)}
-        ):
-            raise ValueError(f"{ACTOR_CORE_ORDER} requires distinct Ray leases for all 64 cores on one node")
+def _check_actor_core_leases(leases):
+    # A split verl pool can report its parent's RAY_LOCAL_WORLD_SIZE, so check the actual leases.
+    nodes = {node for node, _ in leases}
+    if (
+        len(leases) != CORES_PER_NODE
+        or len(nodes) != 1
+        or any(len(ids) != 1 for _, ids in leases)
+        or {ids[0] for _, ids in leases} != {str(i) for i in range(CORES_PER_NODE)}
+    ):
+        raise ValueError(f"{ACTOR_CORE_ORDER} requires distinct Ray leases for all 64 cores on one node")
 
 
-# An actor can initialize both actor and reference engines. Its Ray resource
-# reservation lasts for the worker's lifetime; do not make repeat calls wait
-# for peers which have already initialized.
+# The actor and reference engines of one worker both call this; only the first waits for its peers.
 @functools.lru_cache(maxsize=1)
-def _verify_actor_core_leases(group, rank):
+def _verify_actor_core_leases(group, rank, timeout_s=300):
     import ray
+    from ray.experimental import internal_kv
 
-    # Scope the rendezvous to this worker group and rank block. No actor rank
-    # gives up its Ray lease; the complete set stays reserved throughout training.
     context = ray.get_runtime_context()
     block, local_rank = divmod(rank, CORES_PER_NODE)
-    verifier = (
-        ray.remote(_ActorCoreLeases)
-        .options(
-            name=f"verl-neuron-leases:{context.get_job_id()}:{group}:{block}",
-            get_if_exists=True,
-            num_cpus=0,
-            scheduling_strategy="DEFAULT",
-        )
-        .remote()
-    )
+    prefix = f"verl-neuron-leases:{context.get_job_id()}:{group}:{block}:"
     ids = (
         context.get_accelerator_ids().get("neuron_cores", [])
         if context.get_assigned_resources().get("neuron_cores") == 1
         else []
     )
-    ray.get(verifier.verify.remote(local_rank, context.get_node_id(), ids), timeout=300)
+    internal_kv._internal_kv_put(prefix + str(local_rank), json.dumps([context.get_node_id(), list(ids)]))
+    deadline = time.monotonic() + timeout_s
+    while len(keys := internal_kv._internal_kv_list(prefix)) < CORES_PER_NODE:
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"Only {len(keys)} of {CORES_PER_NODE} actor ranks reported their NeuronCore leases")
+        time.sleep(0.5)
+    _check_actor_core_leases([tuple(json.loads(internal_kv._internal_kv_get(key))) for key in keys])
 
 
 def prepare_worker_environment():

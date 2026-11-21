@@ -4,7 +4,7 @@
 """CPU tests for native Trainium adapters; no accelerator allocation is required."""
 
 import ast
-import asyncio
+import json
 from contextvars import Context
 from pathlib import Path
 from types import SimpleNamespace
@@ -159,31 +159,55 @@ def test_worker_applies_core_order_only_after_verification(monkeypatch):
     assert os.environ["NEURON_RT_VISIBLE_CORES"] == "32"
 
 
-@pytest.mark.parametrize("placement", ["whole_node", "split_nodes", "duplicate_core", "partial_lease"])
+@pytest.mark.parametrize("placement", ["whole_node", "split_nodes", "duplicate_core", "partial_lease", "missing"])
 def test_core_order_requires_actual_exclusive_leases(placement):
-    from verl_hardware_plugin.accelerators.neuron.runtime import _ActorCoreLeases
+    from verl_hardware_plugin.accelerators.neuron.runtime import _check_actor_core_leases
 
-    async def verify():
-        verifier = _ActorCoreLeases()
-        # Ray can assign core IDs in any order. Only all 64 unique, exclusive
-        # leases of a single node authorize the group to permute its cores.
-        leases = [("node-a", [str((rank + 13) % 64)]) for rank in range(64)]
-        if placement == "split_nodes":
-            leases[32:] = [("node-b", ids) for _, ids in leases[32:]]
-        elif placement == "duplicate_core":
-            leases[-1] = leases[0]
-        elif placement == "partial_lease":
-            leases[-1] = ("node-a", [])
-        pending = [asyncio.create_task(verifier.verify(rank, *lease)) for rank, lease in enumerate(leases[:-1])]
-        await asyncio.sleep(0)
-        assert not any(call.done() for call in pending)
-        results = await asyncio.gather(*pending, verifier.verify(63, *leases[-1]), return_exceptions=True)
-        if placement == "whole_node":
-            assert results == [None] * 64
-        else:
-            assert all(isinstance(result, ValueError) for result in results)
+    # Ray can assign core IDs in any order.
+    leases = [("node-a", [str((rank + 13) % 64)]) for rank in range(64)]
+    if placement == "split_nodes":
+        leases[32:] = [("node-b", ids) for _, ids in leases[32:]]
+    elif placement == "duplicate_core":
+        leases[-1] = leases[0]
+    elif placement == "partial_lease":
+        leases[-1] = ("node-a", [])
+    elif placement == "missing":
+        leases = leases[:-1]
+    if placement == "whole_node":
+        _check_actor_core_leases(leases)
+    else:
+        with pytest.raises(ValueError, match="distinct Ray leases"):
+            _check_actor_core_leases(leases)
 
-    asyncio.run(verify())
+
+def test_actor_core_leases_rendezvous_through_the_kv_store(monkeypatch):
+    import ray
+    from ray.experimental import internal_kv
+
+    from verl_hardware_plugin.accelerators.neuron import runtime
+
+    store = {}
+    monkeypatch.setattr(internal_kv, "_internal_kv_put", lambda key, value: store.__setitem__(key, value))
+    monkeypatch.setattr(internal_kv, "_internal_kv_get", lambda key: store[key])
+    monkeypatch.setattr(internal_kv, "_internal_kv_list", lambda prefix: [k for k in store if k.startswith(prefix)])
+    context = SimpleNamespace(
+        get_job_id=lambda: "job",
+        get_node_id=lambda: "node-a",
+        get_assigned_resources=lambda: {"neuron_cores": 1},
+        get_accelerator_ids=lambda: {"neuron_cores": ["63"]},
+    )
+    monkeypatch.setattr(ray, "get_runtime_context", lambda: context)
+    prefix = "verl-neuron-leases:job:group:1:"
+    for local_rank in range(63):
+        store[prefix + str(local_rank)] = json.dumps(["node-a", [str(local_rank)]])
+    runtime._verify_actor_core_leases.cache_clear()
+    runtime._verify_actor_core_leases("group", 64 + 63)
+    assert json.loads(store[prefix + "63"]) == ["node-a", ["63"]]
+
+    runtime._verify_actor_core_leases.cache_clear()
+    store.clear()
+    with pytest.raises(TimeoutError, match="1 of 64"):
+        runtime._verify_actor_core_leases("group", 5, timeout_s=0)
 
 
 @pytest.mark.parametrize("visible,rank,expected", [("7", 0, 7), ("4-7", 2, 6), ("2,6", 1, 6)])

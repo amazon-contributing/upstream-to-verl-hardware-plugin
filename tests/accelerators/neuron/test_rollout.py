@@ -160,7 +160,7 @@ def test_update_advances_after_all_workers_apply(neuron_vllm):
     result = asyncio.run(neuron_vllm.NeuronVLLMHttpServer.update_weights(instance, global_steps=1))
     assert instance.global_steps == 1
     assert result["timing_s/neuron_nixl/receive"] >= 0
-    instance.collective_rpc.assert_awaited_once_with("weight_sync_recv", timeout=10, args=([], 1024))
+    instance.collective_rpc.assert_awaited_once_with("weight_sync_recv", timeout=None, args=([], 1024))
     instance.engine.reset_prefix_cache.assert_awaited_once()
 
 

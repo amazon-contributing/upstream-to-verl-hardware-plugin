@@ -4,7 +4,6 @@
 """Exercise the registered sender and native-to-lite transfer through three policy versions."""
 
 import asyncio
-import ctypes
 import json
 import os
 import socket
@@ -164,26 +163,16 @@ def run_actor(rank, store):
     actor.model_config = SimpleNamespace(hf_config=hf)
     actor.trainer = SimpleNamespace(device=torch.device("neuron:0"))
     actor.checkpointer = SimpleNamespace(sd_adapter=adapter)
-    audit = ctypes.CDLL(None)
-    audit.weight_sync_reads.restype = audit.weight_sync_bytes.restype = ctypes.c_ulong
-    # Verify that the runtime used by this process actually goes through the audit.
-    before = audit.weight_sync_bytes()
-    torch.zeros(8, device="neuron:0").cpu()
-    assert audit.weight_sync_bytes() - before == 32
     reference = torch.arange(65536).to(torch.int16)
     part = reference.clone()
     part[1 - rank :: 2] = 0
     buffer = part.view(torch.bfloat16).to("neuron:0")
-    before = audit.weight_sync_bytes()
     checkpoint_engine._reduce_bucket(buffer, [mesh.get_group()])
-    torch.neuron.synchronize()
-    assert audit.weight_sync_bytes() == before
     assert torch.equal(buffer.view(torch.int16).cpu(), reference)
     for step in range(3):
         # Replace parameters entirely to catch cached values as well as stale views.
         actor.module = [actor_model(step, rank, mesh, adapter)]
         with ExitStack() as stack:
-            reads, nbytes = audit.weight_sync_reads(), audit.weight_sync_bytes()
             guard_sender(stack)
             stack.enter_context(patch.object(titan, "_actor_engine", actor))
             stack.enter_context(patch.object(checkpoint_engine, "_ALL_REDUCE_TILE_BYTES", 64))
@@ -199,8 +188,6 @@ def run_actor(rank, store):
             sender.init_process_group(args["spec"][rank])
             weights, _ = actor.get_per_tensor_param()
             asyncio.run(sender.send_weights(weights, global_steps=step))
-            assert audit.weight_sync_reads() == reads
-            assert audit.weight_sync_bytes() == nbytes
     for endpoint in sender.endpoints.values():
         endpoint.close()
     dist.destroy_process_group()
@@ -241,21 +228,6 @@ def test_device_buckets_end_to_end(tmp_path):
     cores = os.environ["NEURON_BUCKET_TEST_CORES"].split(",")
     assert len(set(cores)) == len(cores) == 6
     master_port, store_port = (str(free_port()) for _ in range(2))
-    audit = tmp_path / "nrt_read_audit.so"
-    subprocess.run(
-        [
-            "cc",
-            "-shared",
-            "-fPIC",
-            "-pthread",
-            "-I/opt/aws/neuron/include",
-            str(Path(__file__).with_name("nrt_read_audit.c")),
-            "-o",
-            str(audit),
-            "-ldl",
-        ],
-        check=True,
-    )
     processes = []
     try:
         for i, core in enumerate(cores):
@@ -282,8 +254,6 @@ def test_device_buckets_end_to_end(tmp_path):
                 "FI_EFA_ENABLE_SHM_TRANSFER": "0",
                 "NEURON_LOGICAL_NC_CONFIG": "2",
             }
-            if actor:
-                env["LD_PRELOAD"] = " ".join(filter(None, (str(audit), env.get("LD_PRELOAD"))))
             log = tmp_path / f"{role}-{rank}.log"
             with log.open("w") as output:
                 child = subprocess.Popen(

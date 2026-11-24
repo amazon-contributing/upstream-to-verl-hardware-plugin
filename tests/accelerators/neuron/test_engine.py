@@ -179,50 +179,9 @@ def test_nixl_bridge_refuses_cpu_fallback(monkeypatch):
         NeuronNixlCheckpointEngine(bucket_size=1024)
 
 
-def test_weight_schedule_uses_bfloat16():
-    engine = SimpleNamespace(hf_parameters=lambda: {"model.norm.weight": torch.ones(4)})
-    schedule = TorchTitanNeuronEngineWithLMHead.weight_sync_metadata(engine)
-    assert schedule == [("model.norm.weight", (4,), "bfloat16")]
-
-
-@pytest.mark.parametrize("cpu_threshold", [0, 8, 9])
-def test_weight_export_gathers_bfloat16_without_mutating_master_weights(cpu_threshold):
-    from torch.distributed.tensor import DTensor
-
-    master = torch.tensor([[1.12345, -2.34567], [3.45678, 4.56789]], requires_grad=True)
-    original = master.detach().clone()
-    sharded = Mock(spec=DTensor)
-    sharded.detach.return_value = sharded
-    converted = Mock(spec=DTensor)
-    sharded.to.return_value = converted
-    converted.numel.return_value = master.numel()
-    converted.element_size.return_value = 2
-    converted.device = master.device
-    host_sharded = Mock(spec=DTensor)
-    converted.to.return_value = host_sharded
-    host_sharded.full_tensor.return_value = master.detach().bfloat16()
-    converted.full_tensor.return_value = master.detach().bfloat16()
-    # A large FP32 gather is the failure this export must avoid.
-    sharded.full_tensor.side_effect = AssertionError("FP32 weight gather exceeds runtime limits")
-    engine = SimpleNamespace(
-        hf_parameters=lambda: {"lm_head.weight": sharded, "model.norm.weight": master},
-        engine_config=SimpleNamespace(weight_sync_cpu_gather_threshold_bytes=cpu_threshold),
-    )
-
-    weights, metadata = TorchTitanNeuronEngineWithLMHead.get_per_tensor_param(engine)
-    exported = dict(weights)
-
-    assert metadata is None
-    sharded.to.assert_called_once_with(dtype=torch.bfloat16)
-    if cpu_threshold == 8:
-        converted.to.assert_called_once_with("cpu")
-        host_sharded.full_tensor.assert_called_once_with()
-        converted.full_tensor.assert_not_called()
-    else:
-        converted.full_tensor.assert_called_once_with()
-        converted.to.assert_not_called()
-    for value in exported.values():
-        torch.testing.assert_close(value, original.bfloat16(), rtol=0, atol=0)
-        assert value.is_contiguous() and not value.requires_grad
-    torch.testing.assert_close(master, original, rtol=0, atol=0)
-    assert master.dtype == torch.float32 and master.requires_grad
+def test_weight_export_reads_live_parameters_without_state_dict():
+    model = torch.nn.Linear(3, 2)
+    model.state_dict = Mock(side_effect=AssertionError("weight sync invoked a state-dict hook"))
+    engine = SimpleNamespace(module=[model])
+    params, metadata = TorchTitanNeuronEngineWithLMHead.get_per_tensor_param(engine)
+    assert dict(params)["weight"] is model.weight and metadata is None

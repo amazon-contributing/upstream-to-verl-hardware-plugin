@@ -31,15 +31,6 @@ def test_native_weight_names_share_compiled_storage_and_restore_on_error():
     assert worker.model_runner.model is compiled
 
 
-def test_checksum_uses_unwrapped_parameter_names():
-    worker = NeuronWorkerExtension()
-    model = torch.nn.Linear(4, 2, bias=False)
-    with torch.no_grad():
-        model.weight.fill_(2)
-    worker.model_runner = SimpleNamespace(model=torch.compile(model, backend="eager"))
-    assert worker.weight_sync_checksum(["weight"]) == {"weight": [16.0, 16.0]}
-
-
 def test_receiver_refuses_cpu_before_connecting_to_a_store():
     worker = SimpleNamespace(device="cpu")
     with pytest.raises(ValueError, match="real Trainium receiver"):

@@ -8,7 +8,7 @@ import os
 import pytest
 import torch
 
-from verl_hardware_plugin.accelerators.neuron.weight_sync.streaming import iter_weight_buckets, validate_box_coverage
+from verl_hardware_plugin.accelerators.neuron.weight_sync.streaming import validate_box_coverage
 from verl_hardware_plugin.accelerators.neuron.weight_sync.weight_layout import (
     apply_box,
     pack_box,
@@ -16,6 +16,12 @@ from verl_hardware_plugin.accelerators.neuron.weight_sync.weight_layout import (
     plan_buckets,
     slot_numel_for,
 )
+
+
+def reference_buckets(weights, buckets):
+    weights = dict(weights)
+    for bucket in buckets:
+        yield torch.cat([weights[e.name].flatten().narrow(0, e.param_offset, e.numel) for e in bucket.entries])
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
@@ -66,9 +72,7 @@ def test_dense_tp_boxes_match_independent_full_tensor_oracle(tp_size, bucket_byt
         validate_box_coverage(plans, inventory)
         slot = torch.zeros(slot_numel_for(plans), dtype=torch.bfloat16)
         actual = {name: torch.full_like(tensor, torch.nan, device=device) for name, tensor in expected.items()}
-        for bucket, plan, buffer in zip(
-            buckets, plans, iter_weight_buckets(weights.items(), buckets, "cpu"), strict=True
-        ):
+        for bucket, plan, buffer in zip(buckets, plans, reference_buckets(weights, buckets), strict=True):
             pack_box(slot, buffer, bucket, plan)
             apply_box(slot, plan, actual)
         for name in expected:
@@ -108,7 +112,7 @@ def test_fused_bias_layout_and_incomplete_qkv_are_rejected_or_mapped():
     validate_box_coverage(plans, inventory)
     actual = {prefix + "qkv_proj_bias": torch.zeros(8, dtype=torch.bfloat16)}
     slot = torch.zeros(slot_numel_for(plans), dtype=torch.bfloat16)
-    for bucket, plan, buffer in zip(buckets, plans, iter_weight_buckets(weights, buckets, "cpu"), strict=True):
+    for bucket, plan, buffer in zip(buckets, plans, reference_buckets(weights, buckets), strict=True):
         pack_box(slot, buffer, bucket, plan)
         apply_box(slot, plan, actual)
     assert actual[prefix + "qkv_proj_bias"].tolist() == [4, 5, 6, 7, 2, 3, 2, 3]

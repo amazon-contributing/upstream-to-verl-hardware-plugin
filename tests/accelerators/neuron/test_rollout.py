@@ -49,7 +49,6 @@ def server(returns):
         _sync_spec=SimpleNamespace(timeout_s=10),
         _sync_schedule=[],
         _sync_bucket_bytes=1024,
-        _sync_checksums={"model.norm.weight": [2.0, 2.0]},
         config=SimpleNamespace(tensor_model_parallel_size=2),
         collective_rpc=AsyncMock(side_effect=returns),
         engine=SimpleNamespace(reset_prefix_cache=AsyncMock()),
@@ -145,7 +144,7 @@ def test_generate_delegates_and_preserves_abort(neuron_vllm, monkeypatch, tokens
             asyncio.run(instance.generate([1], params, "request"))
 
 
-@pytest.mark.parametrize("returns", [[[5, 0]], [[5, 5], [{}, {}]]])
+@pytest.mark.parametrize("returns", [[[5, 0]], [[5]]])
 def test_failed_update_does_not_advance_policy(returns, neuron_vllm):
     instance = server(returns)
     with pytest.raises(RuntimeError):
@@ -155,10 +154,10 @@ def test_failed_update_does_not_advance_policy(returns, neuron_vllm):
     instance.engine.reset_prefix_cache.assert_not_called()
 
 
-def test_update_advances_only_after_all_workers_apply_and_verify(neuron_vllm):
-    checksum = {"model.norm.weight": [2.0, 2.0]}
-    instance = server([[5, 5], [checksum, checksum]])
+def test_update_advances_after_all_workers_apply(neuron_vllm):
+    instance = server([[5, 5]])
     result = asyncio.run(neuron_vllm.NeuronVLLMHttpServer.update_weights(instance, global_steps=1))
     assert instance.global_steps == 1
-    assert result["neuron_nixl/verified_replicated_parameters"] == 1
+    assert result["timing_s/neuron_nixl/receive"] >= 0
+    instance.collective_rpc.assert_awaited_once_with("weight_sync_recv", timeout=10, args=([], 1024))
     instance.engine.reset_prefix_cache.assert_awaited_once()

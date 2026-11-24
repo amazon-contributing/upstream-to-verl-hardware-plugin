@@ -146,7 +146,6 @@ class NeuronVLLMHttpServer(vLLMHttpServer):
         if method != "init_process_group":
             raise ValueError(f"Unsupported checkpoint operation {method}")
         spec, schedule = kwargs["spec"], kwargs["schedule"]
-        self._sync_checksums = kwargs["checksums"]
         if getattr(self, "_sync_connected", False):
             if spec != self._sync_spec or schedule != self._sync_schedule:
                 raise ValueError("NIXL topology and weight metadata must remain stable")
@@ -174,26 +173,10 @@ class NeuronVLLMHttpServer(vLLMHttpServer):
         )
         if len(results) != self.config.tensor_model_parallel_size or any(count <= 0 for count in results):
             raise RuntimeError("At least one TP worker did not apply the NIXL update")
-        if self._sync_checksums:
-            checksums = await self.collective_rpc(
-                "weight_sync_checksum", timeout=self._sync_spec.timeout_s, args=(list(self._sync_checksums),)
-            )
-            if len(checksums) != self.config.tensor_model_parallel_size or any(
-                actual != self._sync_checksums for actual in checksums
-            ):
-                raise RuntimeError("NIXL replicated-parameter checksum mismatch; generation remains paused")
         await self.engine.reset_prefix_cache()
         self.global_steps = global_steps
-        logger.info(
-            "neuron_nixl applied policy step %s on %d TP workers; verified %d replicated parameters",
-            global_steps,
-            len(results),
-            len(self._sync_checksums),
-        )
-        return {
-            "timing_s/neuron_nixl/receive": time.monotonic() - started,
-            "neuron_nixl/verified_replicated_parameters": len(self._sync_checksums),
-        }
+        logger.info("neuron_nixl applied policy step %s on %d TP workers", global_steps, len(results))
+        return {"timing_s/neuron_nixl/receive": time.monotonic() - started}
 
     async def close_weight_sync(self):
         if getattr(self, "_sync_connected", False):

@@ -256,6 +256,10 @@ inputs. CP, EP, and PP remain one; packed inputs, offloading, MoE, quantization,
 learned critics, multimodal inputs, colocated rollout, and multi-node jobs are
 outside the supported configuration.
 
+The `neuron_nixl` sender assembles BF16 buckets from live TorchTitan shards on
+Trainium. `update_weights_bucket_megabytes` controls the bucket size. Remove
+`weight_sync_cpu_gather_threshold_bytes` from existing job overrides.
+
 We use CPU sampling because vLLM-Neuron's current on-device sampler limits
 sampling to at most 256 candidates, even with `top_k: -1`.
 

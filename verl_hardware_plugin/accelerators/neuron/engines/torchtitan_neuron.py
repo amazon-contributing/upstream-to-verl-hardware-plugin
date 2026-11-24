@@ -13,7 +13,6 @@ from tempfile import gettempdir
 from uuid import uuid4
 
 import torch
-from torch.distributed.tensor import DTensor
 
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
@@ -195,37 +194,11 @@ class TorchTitanNeuronEngineWithLMHead(TorchTitanEngineWithLMHead):
                 )
         return loss, {"model_output": detach_tree(model_output), "loss": loss.detach().item(), "metrics": metrics}
 
-    def hf_parameters(self):
-        params = {}
-        for module in self.module:
-            params.update(module.state_dict())
-        converted = self._to_hf_named_params(params)
-        if self.model_config.hf_config.tie_word_embeddings:
-            converted["lm_head.weight"] = converted["model.embed_tokens.weight"]
-        return dict(sorted(converted.items()))
-
-    def weight_sync_metadata(self):
-        return [(name, tuple(value.shape), "bfloat16") for name, value in self.hf_parameters().items()]
-
     def get_per_tensor_param(self, **kwargs):
-        cpu_threshold = self.engine_config.weight_sync_cpu_gather_threshold_bytes
-
-        def tensors():
-            for name, value in self.hf_parameters().items():
-                # Rollout consumes BF16. Cast local shards before gathering so
-                # large FP32 embeddings do not exceed Neuron collective limits.
-                value = value.detach().to(dtype=torch.bfloat16)
-                if isinstance(value, DTensor):
-                    if cpu_threshold and value.numel() * value.element_size() >= cpu_threshold:
-                        # Large Qwen3-14B exports hit a native collective DMA
-                        # alignment failure. Keep the full gather on the host;
-                        # iter_weight_buckets copies bounded slices to Neuron.
-                        value = value.to("cpu").full_tensor()
-                    else:
-                        value = value.full_tensor()
-                yield name, value.contiguous()
-
-        return tensors(), None
+        # verl passes this iterable directly to neuron_nixl.send_weights. Keep
+        # the DTensors intact so the sender can read only its local shards.
+        (model,) = self.module
+        return model.named_parameters(remove_duplicate=False), None
 
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None, **kwargs):
         if hdfs_path:

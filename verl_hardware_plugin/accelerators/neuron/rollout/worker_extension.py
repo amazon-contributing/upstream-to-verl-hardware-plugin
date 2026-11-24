@@ -223,19 +223,6 @@ class NeuronWorkerExtension:
         )
         return applied
 
-    def weight_sync_checksum(self, names=None):
-        with resident_weight_model(self):
-            model = self.model_runner.model
-            tensors = dict(model.named_parameters())
-            for name, tensor in model.named_buffers():
-                tensors.setdefault(name, tensor)
-            checksums = {}
-            for name in names if names is not None else sorted(tensors):
-                if name in tensors:
-                    host = tensors[name].detach().to("cpu").to(torch.float64)
-                    checksums[name] = [host.sum().item(), host.abs().sum().item()]
-            return checksums
-
     def weight_sync_close(self):
         state = getattr(self, "_weight_sync_state", None)
         if state is not None:

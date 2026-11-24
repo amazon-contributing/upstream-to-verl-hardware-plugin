@@ -16,8 +16,6 @@ class NeuronTorchtitanEngineConfig(TorchtitanEngineConfig):
     spmd_backend: str = "default"
     max_seq_len: int = 1024
     activation_checkpoint: str = "none"
-    # Zero disables host gathering; otherwise applies to full BF16 export size.
-    weight_sync_cpu_gather_threshold_bytes: int = 0
 
     def __post_init__(self):
         EngineConfig.__post_init__(self)
@@ -35,8 +33,3 @@ class NeuronTorchtitanEngineConfig(TorchtitanEngineConfig):
             raise ValueError("Trainium max_seq_len must be a positive multiple of 512")
         if self.dtype != "bfloat16":
             raise ValueError("Trainium v1 requires dtype=bfloat16")
-        if (
-            not isinstance(self.weight_sync_cpu_gather_threshold_bytes, int)
-            or self.weight_sync_cpu_gather_threshold_bytes < 0
-        ):
-            raise ValueError("weight_sync_cpu_gather_threshold_bytes must be a nonnegative integer")

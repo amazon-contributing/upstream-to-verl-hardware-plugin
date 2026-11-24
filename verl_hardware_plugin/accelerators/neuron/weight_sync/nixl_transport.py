@@ -145,7 +145,7 @@ class NixlEndpoint:
         self.buffer = self.registration = self.remote = None
         self.address = self.remote_address = None
         self.transfers = {}
-        torch.zeros(1, device=self.device).cpu()
+        torch.zeros(1, device=self.device)
         synchronize(lite=lite)
         if "FI_EFA_IFACE" not in os.environ:
             os.environ["FI_EFA_IFACE"] = efa_interface(core)

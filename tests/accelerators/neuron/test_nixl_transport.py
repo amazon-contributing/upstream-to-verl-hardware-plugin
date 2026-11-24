@@ -182,7 +182,6 @@ def test_nixl_topology_is_local_and_assigns_every_replica(checkpoint_engine):
         "host": "localhost",
         "port": 12345,
         "timeout_s": 30,
-        "checksums": {},
     }
     metadata = [actor, actor.copy(), {"rollout_tp": 2}, {"rollout_tp": 2}]
     trainer, rollout = checkpoint_engine.NeuronNixlCheckpointEngine.build_topology(2, 2, metadata)
@@ -201,34 +200,10 @@ def test_nixl_topology_is_local_and_assigns_every_replica(checkpoint_engine):
         checkpoint_engine.NeuronNixlCheckpointEngine.build_topology(2, 2, metadata)
 
 
-def test_export_ranks_cannot_advance_past_sender(checkpoint_engine, monkeypatch):
-    events = []
-    group = object()
-    monkeypatch.setattr(checkpoint_engine, "plan_buckets", lambda *args, **kwargs: [object(), object()])
-
-    def buffers(*args):
-        for index in range(2):
-            events.append(f"export-{index}")
-            yield torch.ones(4)
-
-    monkeypatch.setattr(checkpoint_engine, "iter_weight_buckets", buffers)
-    monkeypatch.setattr(checkpoint_engine, "synchronize", lambda: events.append("sync"))
-
-    def barrier(*, group):
-        assert group is instance.export_group
-        events.append("barrier")
-
-    monkeypatch.setattr(torch.distributed, "barrier", barrier)
-    instance = SimpleNamespace(
-        connected=True, schedule=[], bucket_size=8, endpoints={}, export_group=group, device="cpu", rank=1
-    )
-    asyncio.run(checkpoint_engine.NeuronNixlCheckpointEngine.send_weights(instance, []))
-    assert events == ["barrier", "export-0", "sync", "barrier", "barrier", "export-1", "sync", "barrier", "barrier"]
-
-
 @pytest.mark.parametrize("tp_rank", range(4))
 def test_sync_transfers_only_resident_weights_and_skips_empty_buckets(checkpoint_engine, monkeypatch, tp_rank):
-    monkeypatch.setattr(checkpoint_engine, "synchronize", lambda: None)
+    from verl_hardware_plugin.accelerators.neuron.weight_sync.device_buckets import DeviceBucketLayout, describe
+
     monkeypatch.setattr(torch.distributed, "barrier", lambda **kwargs: None)
     weights = {
         "linear.weight": torch.arange(48, dtype=torch.bfloat16).reshape(12, 4),
@@ -266,15 +241,24 @@ def test_sync_transfers_only_resident_weights_and_skips_empty_buckets(checkpoint
     sender.push = push
     receiver.register = lambda numel: register(receiver, numel)
     receiver.receive = receive
+    hf = SimpleNamespace(tie_word_embeddings=False)
+    layout = DeviceBucketLayout(
+        [{name: describe(value) for name, value in weights.items()}],
+        0,
+        hf,
+        {name: name for name in weights},
+        bucket_bytes=32,
+    )
+    shapes = dict((name, shape) for name, shape, dtype in schedule)
+    plans = [checkpoint_engine.plan_box(bucket, shapes, inventory, tp_rank, 4) for bucket in layout.buckets]
     engine = SimpleNamespace(
         connected=True,
-        schedule=schedule,
-        bucket_size=32,
+        layout=layout,
         endpoints={(0, tp_rank): sender},
-        inventories={(0, tp_rank): inventory},
-        spec=SimpleNamespace(rollout_tp=4),
+        plans={(0, tp_rank): plans},
+        device_groups=[],
         export_group=object(),
-        device="cpu",
+        device=torch.device("cpu"),
         rank=1,
     )
     worker = SimpleNamespace(
@@ -282,12 +266,12 @@ def test_sync_transfers_only_resident_weights_and_skips_empty_buckets(checkpoint
             endpoint=receiver, inventory=inventory, tensors=tensors, rank=tp_rank, size=4
         )
     )
-    bucket_count = len(checkpoint_engine.plan_buckets(schedule, bucket_bytes=32))
+    bucket_count = len(layout.buckets)
     for step in range(2):
         updated = {name: tensor + 100 * step for name, tensor in weights.items()}
         sizes.clear()
         asyncio.run(checkpoint_engine.NeuronNixlCheckpointEngine.send_weights(engine, updated.items()))
-        NeuronWorkerExtension.weight_sync_recv(worker, schedule, 32)
+        NeuronWorkerExtension.weight_sync_recv(worker, layout.schedule, 32)
         assert not payloads
         assert 0 < len(sizes) < bucket_count
         assert len(set(sizes)) > 1
@@ -314,7 +298,15 @@ def test_nixl_fanout_assigns_every_receiver_once(checkpoint_engine, monkeypatch,
     loads = []
     for rank in range(world_size):
         instance = SimpleNamespace(
-            rank=rank, world_size=world_size, connected=False, endpoints={}, inventories={}, device="neuron", core=rank
+            rank=rank,
+            world_size=world_size,
+            connected=False,
+            endpoints={},
+            plans={},
+            device="neuron",
+            core=rank,
+            schedule=[],
+            layout=SimpleNamespace(buckets=[]),
         )
         checkpoint_engine.NeuronNixlCheckpointEngine.init_process_group(instance, spec)
         assert instance.connected

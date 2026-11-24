@@ -22,7 +22,7 @@ from verl_hardware_plugin.accelerators.neuron.runtime import (
     physical_core,
     prepare_worker_environment,
 )
-from verl_hardware_plugin.accelerators.neuron.weight_sync.streaming import iter_weight_buckets, validate_box_coverage
+from verl_hardware_plugin.accelerators.neuron.weight_sync.streaming import validate_box_coverage
 
 
 def test_compile_settings_survive_a_new_rpc_context(monkeypatch):
@@ -176,24 +176,6 @@ def test_static_rows_do_not_cross_sample_boundaries():
         padded_inputs(inputs, 2, 0)
 
 
-def entry(name, shape, numel, offset=0, param_offset=0):
-    return SimpleNamespace(name=name, shape=shape, numel=numel, offset=offset, param_offset=param_offset)
-
-
-def test_streaming_buckets_split_parameters():
-    buckets = [
-        SimpleNamespace(buf_numel=4, entries=[entry("first", (6,), 4)]),
-        SimpleNamespace(buf_numel=4, entries=[entry("first", (6,), 2, param_offset=4), entry("second", (1,), 1, 2)]),
-    ]
-    weights = [("first", torch.arange(6, dtype=torch.bfloat16)), ("second", torch.tensor([9], dtype=torch.bfloat16))]
-    actual = [buffer.tolist() for buffer in iter_weight_buckets(weights, buckets, "cpu")]
-    assert actual == [[0, 1, 2, 3], [4, 5, 9, 0]]
-    with pytest.raises(ValueError, match="Missing"):
-        list(iter_weight_buckets(weights[:1], buckets, "cpu"))
-    with pytest.raises(ValueError, match="schedule"):
-        list(iter_weight_buckets(list(reversed(weights)), buckets, "cpu"))
-
-
 def test_coverage_is_fail_closed():
     piece = SimpleNamespace(name="weight", numel=4, dst_box=((0, 2), (0, 2)))
     plan = SimpleNamespace(pieces=[piece], skipped=[])
@@ -204,15 +186,6 @@ def test_coverage_is_fail_closed():
         validate_box_coverage([plan, plan], {"weight": (2, 2)})
     with pytest.raises(ValueError, match="cannot apply"):
         validate_box_coverage([SimpleNamespace(skipped=["unknown"], pieces=[])], {})
-
-
-def test_stream_rejects_extra_parameters_and_wrong_dtype():
-    bucket = SimpleNamespace(buf_numel=2, entries=[entry("first", (2,), 2)])
-    weights = [("first", torch.ones(2, dtype=torch.bfloat16)), ("extra", torch.ones(1, dtype=torch.bfloat16))]
-    with pytest.raises(ValueError, match="absent"):
-        list(iter_weight_buckets(weights, [bucket], "cpu"))
-    with pytest.raises(ValueError, match="bfloat16"):
-        list(iter_weight_buckets([("first", torch.ones(2))], [bucket], "cpu"))
 
 
 def test_coverage_rejects_same_size_overlaps():

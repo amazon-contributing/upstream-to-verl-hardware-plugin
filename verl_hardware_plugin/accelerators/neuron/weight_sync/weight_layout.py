@@ -191,13 +191,27 @@ def _slices(box):
 
 
 def pack_box(slot, buffer, bucket, plan):
+    """torch-neuronx compiles one eager graph per storage offset, so pieces that need a graph (a
+    transpose or a column window) are first copied to a fresh tensor at offset 0.
+    """
     for piece in plan.pieces:
         entry = bucket.entries[piece.entry_index]
-        fragment = buffer[entry.offset : entry.offset + entry.numel].view(-1, *entry.shape[1:])
-        source = fragment[_slices(piece.src_box)]
+        width = prod(entry.shape[1:])
+        (first, last), columns = piece.src_box[0], piece.src_box[1:]
+        rows = buffer[entry.offset + first * width : entry.offset + last * width]
+        target = slot[piece.box_offset : piece.box_offset + piece.numel]
+        whole_rows = all(
+            start == 0 and end == extent for (start, end), extent in zip(columns, entry.shape[1:], strict=True)
+        )
+        if whole_rows and not piece.transposed:
+            target.copy_(rows)
+            continue
+        staged = rows.clone().view(last - first, *entry.shape[1:])
         if piece.transposed:
-            source = source.transpose(0, 1)
-        slot[piece.box_offset : piece.box_offset + piece.numel].copy_(source.reshape(-1))
+            ((start, end),) = columns
+            target.copy_(staged.t().contiguous()[start:end].reshape(-1))
+        else:
+            target.copy_(staged[(slice(None),) + _slices(columns)].reshape(-1))
 
 
 def apply_box(host_buffer, plan, tensors):

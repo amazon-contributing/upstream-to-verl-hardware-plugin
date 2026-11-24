@@ -257,7 +257,9 @@ learned critics, multimodal inputs, colocated rollout, and multi-node jobs are
 outside the supported configuration.
 
 The `neuron_nixl` sender assembles BF16 buckets from live TorchTitan shards on
-Trainium. `update_weights_bucket_megabytes` controls the bucket size. Remove
+Trainium. NIXL transfers each TP rank's slices into a rollout HBM buffer.
+The receiver applies them directly to the model's resident weights, including
+the FP32 GDN parameters in the hybrid decoder. `update_weights_bucket_megabytes` controls the bucket size. Remove
 `weight_sync_cpu_gather_threshold_bytes` from existing job overrides.
 
 We use CPU sampling because vLLM-Neuron's current on-device sampler limits

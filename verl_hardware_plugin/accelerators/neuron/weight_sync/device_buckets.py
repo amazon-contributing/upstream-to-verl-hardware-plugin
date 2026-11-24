@@ -134,7 +134,9 @@ class CopyRows:
             source = source.clone()
         source = source.to(torch.bfloat16)
         if self.columns != self.width:
-            source = F.pad(source.reshape(self.rows, self.columns), (self.column, self.width - self.column - self.columns))
+            source = F.pad(
+                source.reshape(self.rows, self.columns), (self.column, self.width - self.column - self.columns)
+            )
         buffer.narrow(0, self.offset, self.rows * self.width).copy_(source.reshape(-1))
 
 

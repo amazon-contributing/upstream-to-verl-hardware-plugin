@@ -160,7 +160,11 @@ def _target_regions(name, shapes, inventory, rank, size):
     full = tuple(shapes[name])
     folded = re.sub(r"\.(weight|bias)$", r"_\1", name)
     targets = [name] if name in inventory else [folded] if folded in inventory else []
-    if name in {"model.embed_tokens.weight", "language_model.embed_tokens.weight"} and "lm_head.weight" not in shapes and "lm_head.weight" in inventory:
+    if (
+        name in {"model.embed_tokens.weight", "language_model.embed_tokens.weight"}
+        and "lm_head.weight" not in shapes
+        and "lm_head.weight" in inventory
+    ):
         targets.append("lm_head.weight")
     regions = []
     for target in targets:

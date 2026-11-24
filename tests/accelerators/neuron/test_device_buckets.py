@@ -60,6 +60,66 @@ def test_incomplete_or_overlapping_actor_coverage(end):
         owned_shards([{"norm": s} for s in shards], 0)
 
 
+def test_hybrid_projections_from_actor_shards_to_native_rollout():
+    from verl_hardware_plugin.accelerators.neuron.weight_sync.device_buckets import DeviceBucketLayout, Shard
+    from verl_hardware_plugin.accelerators.neuron.weight_sync.streaming import validate_box_coverage
+    from verl_hardware_plugin.accelerators.neuron.weight_sync.weight_layout import apply_box, pack_box, plan_box
+
+    prefix = "layers.0.attn."
+    weights = {}
+    for part, rows in (("q", 4), ("k", 4), ("v", 12), ("z", 12)):
+        values = torch.arange(rows * 6).view(rows, 6) + len(weights) * 100
+        weights[prefix + f"in_proj_{part}.weight"] = values.bfloat16()
+        if part != "z":
+            weights[prefix + f"conv_{part}.weight"] = values[:, :4].reshape(rows, 1, 4).bfloat16()
+    for name in ("A_log", "dt_bias"):
+        weights[prefix + name] = torch.arange(12).float()
+    adapter = {
+        f"model.language_model.layers.{{}}.linear_attn.{name}": f"layers.{{}}.attn.{name}"
+        for name in ("in_proj_z.weight", "A_log", "dt_bias")
+    }
+    metadata, locals_ = [], []
+    for rank in range(2):
+        shards, local = {}, {}
+        for name, weight in weights.items():
+            axis = weight.ndim - 1
+            local[name] = weight.chunk(2, axis)[rank]
+            offset = [0] * weight.ndim
+            offset[axis] = rank * local[name].shape[axis]
+            shards[name] = Shard(tuple(weight.shape), tuple(offset), tuple(local[name].shape))
+        metadata.append(shards)
+        locals_.append(local)
+    hf = SimpleNamespace(text_config=SimpleNamespace(tie_word_embeddings=False))
+    layouts = [DeviceBucketLayout(metadata, rank, hf, adapter, bucket_bytes=44) for rank in range(2)]
+    shapes = {name: shape for name, shape, _ in layouts[0].schedule}
+    buckets = layouts[0].buckets
+    for rank in range(4):
+        resident = "language_model.layers.0.linear_attn."
+        qkvz = [weights[prefix + f"in_proj_{part}.weight"].chunk(4)[rank] for part in "qkvz"]
+        conv = [weights[prefix + f"conv_{part}.weight"].chunk(4)[rank] for part in "qkv"]
+        expected = {
+            resident + "in_proj_qkvz_weight": torch.cat(qkvz).T.contiguous(),
+            resident + "conv1d_weight": torch.cat(conv),
+            **{resident + name: weights[prefix + name].chunk(4)[rank] for name in ("A_log", "dt_bias")},
+        }
+        inventory = {name: tuple(weight.shape) for name, weight in expected.items()}
+        plans = [plan_box(bucket, shapes, inventory, rank, 4) for bucket in buckets]
+        validate_box_coverage(plans, inventory)
+        actual = {name: torch.full_like(weight, torch.nan) for name, weight in expected.items()}
+        for index, (bucket, plan) in enumerate(zip(buckets, plans, strict=True)):
+            buffer = torch.zeros(bucket.buf_numel, dtype=torch.bfloat16)
+            for layout, local in zip(layouts, locals_, strict=True):
+                contribution = torch.zeros_like(buffer)
+                for copy in layout.copies[index]:
+                    copy.copy(contribution, local[copy.source])
+                buffer += contribution
+            slot = torch.empty(plan.numel, dtype=torch.bfloat16)
+            pack_box(slot, buffer, bucket, plan)
+            apply_box(slot, plan, actual, {})
+        for name, weight in expected.items():
+            torch.testing.assert_close(actual[name], weight, rtol=0, atol=0)
+
+
 def host_weights(step):
     generator = torch.Generator().manual_seed(31 + step)
     shapes = {"model.embed_tokens.weight": (20, 9), "model.norm.weight": (9,)}

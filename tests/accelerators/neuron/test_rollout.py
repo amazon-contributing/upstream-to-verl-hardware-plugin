@@ -192,3 +192,88 @@ def test_qwen35_rollout_configures_v2_device_sampling_before_compile(monkeypatch
         "on_device_sampling_config": {"max_top_k": 128},
     }
     assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+
+
+def speculative_config(**overrides):
+    from omegaconf import OmegaConf
+
+    config = {
+        "calculate_log_probs": False,
+        "temperature": 1.0,
+        "top_k": 256,
+        "val_kwargs": {"do_sample": True, "temperature": 0.6, "top_k": 20},
+        "mtp": {"enable": False, "enable_rollout": False},
+    }
+    return OmegaConf.merge(OmegaConf.create(config), OmegaConf.create(overrides))
+
+
+@pytest.mark.parametrize("method", ["dflash", "eagle3"])
+def test_speculative_decoding_selects_the_device_sampler(monkeypatch, neuron_vllm, method):
+    monkeypatch.delenv("NEURON_RT_VISIBLE_CORES", raising=False)
+    instance = object.__new__(neuron_vllm.NeuronVLLMHttpServer)
+    instance.config = speculative_config()
+    kwargs = {"speculative_config": {"method": method, "model": "/draft", "num_speculative_tokens": 15}}
+    instance._preprocess_engine_kwargs(kwargs)
+    assert instance._speculative_decoding
+    assert kwargs["additional_config"]["neuron_config"]["on_device_sampling_config"] == {"max_top_k": 256}
+    assert kwargs["speculative_config"]["method"] == method
+
+
+@pytest.mark.parametrize(
+    "overrides,method,match",
+    [
+        ({}, "ngram", "supports methods dflash, eagle3"),
+        ({}, None, "supports methods dflash, eagle3"),
+        ({"calculate_log_probs": True}, "dflash", "calculate_log_probs=false"),
+        ({"top_k": -1}, "dflash", "top_k=-1"),
+        ({"top_k": 512}, "dflash", "top_k=512"),
+        ({"val_kwargs": {"top_k": -1}}, "dflash", "top_k=-1"),
+        ({"mtp": {"enable": True, "enable_rollout": True}}, "dflash", "MTP"),
+    ],
+)
+def test_speculative_decoding_rejects_unsupported_rollout_settings(monkeypatch, neuron_vllm, overrides, method, match):
+    monkeypatch.delenv("NEURON_RT_VISIBLE_CORES", raising=False)
+    instance = object.__new__(neuron_vllm.NeuronVLLMHttpServer)
+    instance.config = speculative_config(**overrides)
+    with pytest.raises(ValueError, match=match):
+        instance._preprocess_engine_kwargs({"speculative_config": {"method": method}})
+
+
+def test_speculative_decoding_allows_greedy_validation_without_top_k(monkeypatch, neuron_vllm):
+    monkeypatch.delenv("NEURON_RT_VISIBLE_CORES", raising=False)
+    instance = object.__new__(neuron_vllm.NeuronVLLMHttpServer)
+    instance.config = speculative_config(val_kwargs={"do_sample": False, "top_k": -1})
+    instance._preprocess_engine_kwargs({"speculative_config": {"method": "dflash"}})
+
+
+def test_speculative_decoding_is_rejected_for_the_qwen38_rollout(monkeypatch, neuron_vllm):
+    monkeypatch.delenv("NEURON_RT_VISIBLE_CORES", raising=False)
+    instance = object.__new__(neuron_vllm.NeuronVLLMHttpServer)
+    instance.config = speculative_config()
+    instance.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_5"))
+    with pytest.raises(ValueError, match="Qwen3.8"):
+        instance._preprocess_engine_kwargs({"speculative_config": {"method": "dflash"}})
+
+
+@pytest.mark.parametrize(
+    "params,match",
+    [
+        ({"temperature": 1.0, "top_k": 256, "logprobs": True}, "token ids only"),
+        ({"temperature": 1.0, "top_k": 256, "logprobs": 0}, "token ids only"),
+        ({"temperature": 1.0, "top_k": -1}, "at most 256 candidates"),
+        ({"temperature": 1.0, "top_k": 0}, "at most 256 candidates"),
+        ({"temperature": 0.0, "top_k": -1, "logprobs": False}, None),
+        ({"temperature": 1.0, "top_k": 256, "top_p": 0.9, "logprobs": False}, None),
+    ],
+)
+def test_speculative_requests_need_token_ids_only_and_a_bounded_top_k(neuron_vllm, params, match):
+    instance = object.__new__(neuron_vllm.NeuronVLLMHttpServer)
+    instance._speculative_decoding = True
+    if match is None:
+        instance._preprocess_sampling_params(params)
+    else:
+        with pytest.raises(ValueError, match=match):
+            instance._preprocess_sampling_params(params)
+    # Without speculative decoding the CPU sampler serves the full vocabulary and log-probabilities.
+    instance._speculative_decoding = False
+    instance._preprocess_sampling_params({"temperature": 1.0, "top_k": -1, "logprobs": True})

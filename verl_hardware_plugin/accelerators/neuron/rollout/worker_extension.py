@@ -310,7 +310,14 @@ class NeuronWorkerExtension:
         def sample(model_output_tensor, spec_decode_metadata=None):
             metadata = runner.input_batch.sampling_metadata
             _validate_sampling_metadata(metadata)
-            if spec_decode_metadata is not None or getattr(runner, "_jf_active_tokens", None):
+            if spec_decode_metadata is not None:
+                # vLLM-Neuron's on-device rejection sampler returns accepted token ids only.
+                if not runner.on_device_sampling:
+                    raise NotImplementedError("Neuron speculative decoding requires the on-device sampler")
+                if metadata.max_num_logprobs is not None:
+                    raise ValueError("Neuron speculative decoding does not return rollout log-probabilities")
+                return original_sample(model_output_tensor, spec_decode_metadata)
+            if getattr(runner, "_jf_active_tokens", None):
                 raise NotImplementedError("Native verl log-probabilities require ordinary autoregressive decoding")
             if not runner.on_device_sampling:
                 # The native CPU path returns logits, but InputBatch keeps its

@@ -26,6 +26,43 @@ def qwen35_rollout(model_config):
     return getattr(hf, "model_type", None) in {"qwen3_5", "qwen3_5_text"}
 
 
+# Speculative decoding uses vLLM-Neuron's on-device sampler and rejection sampler. They return token ids only and
+# sample from at most DEVICE_SAMPLER_MAX_TOP_K candidates, so settings that would need more are rejected up front.
+SPECULATIVE_METHODS = ("dflash", "eagle3")  # the methods vLLM-Neuron's V1 runner implements
+DEVICE_SAMPLER_MAX_TOP_K = 256
+
+
+def check_speculative_sampling(params):
+    """Reject request settings that the on-device speculative path cannot honor exactly."""
+    logprobs = params.get("logprobs")
+    if logprobs is not None and logprobs is not False:
+        raise ValueError(
+            "Speculative decoding on Neuron returns token ids only. Set "
+            "actor_rollout_ref.rollout.calculate_log_probs=false; the actor computes the log-probabilities"
+        )
+    temperature, top_k = params.get("temperature", 1.0), params.get("top_k", -1)
+    if temperature > 0 and not 1 <= top_k <= DEVICE_SAMPLER_MAX_TOP_K:
+        raise ValueError(
+            f"Speculative decoding on Neuron samples from at most {DEVICE_SAMPLER_MAX_TOP_K} candidates. "
+            f"Set top_k between 1 and {DEVICE_SAMPLER_MAX_TOP_K} for sampled requests (got top_k={top_k})"
+        )
+
+
+def check_speculative_rollout(config, speculative_config):
+    """Fail before compilation when the rollout configuration cannot use speculative decoding."""
+    method = speculative_config.get("method")
+    if method not in SPECULATIVE_METHODS:
+        raise ValueError(
+            f"Neuron speculative decoding supports methods {', '.join(SPECULATIVE_METHODS)}, got {method!r}"
+        )
+    check_speculative_sampling(
+        {"logprobs": config.calculate_log_probs, "temperature": config.temperature, "top_k": config.top_k}
+    )
+    validation = config.val_kwargs
+    if validation.do_sample:
+        check_speculative_sampling({"temperature": validation.temperature, "top_k": validation.top_k})
+
+
 def serving_environment():
     environment = {
         "VERL_PLATFORM": "aws",
@@ -100,11 +137,18 @@ class NeuronVLLMHttpServer(vLLMHttpServer):
             async_scheduling=False,
             compilation_config={"cudagraph_mode": "NONE"},
         )
+        mtp = getattr(getattr(self, "config", None), "mtp", None)
+        if mtp is not None and mtp.enable and mtp.enable_rollout:
+            raise ValueError("Neuron rollout does not support MTP speculative decoding")
+        speculative = engine_kwargs.get("speculative_config")
+        self._speculative_decoding = speculative is not None
         # The Ray replica receives an unresolved DictConfig. Only the HTTP
         # server has loaded HFModelConfig, and its MP workers inherit this env.
         hybrid = qwen35_rollout(getattr(self, "model_config", None))
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if hybrid else "0"
         if hybrid:
+            if self._speculative_decoding:
+                raise ValueError("Speculative decoding is not supported for the Qwen3.8 rollout")
             os.environ["TORCH_CACHING_PRECOMPILE"] = "0"
             os.environ["VLLM_NEURON_DISABLE_PARALLEL_TRACE"] = "1"
             from verl.workers.rollout.utils import get_vision_placeholder_token_ids
@@ -118,9 +162,13 @@ class NeuronVLLMHttpServer(vLLMHttpServer):
             return
         # Return logits from Neuron and use vLLM's host sampler. The pinned
         # device sampler silently caps candidates even when top_k=-1.
+        # Speculative decoding needs the device sampler and its rejection
+        # sampler; check_speculative_rollout makes the cap explicit instead.
+        if self._speculative_decoding:
+            check_speculative_rollout(self.config, speculative)
         engine_kwargs.setdefault("additional_config", {}).setdefault("neuron_config", {}).update(
             enable_structured_outputs=True,
-            on_device_sampling_config=None,
+            on_device_sampling_config={"max_top_k": DEVICE_SAMPLER_MAX_TOP_K} if self._speculative_decoding else None,
         )
 
     def _get_worker_extension_cls(self):
@@ -147,6 +195,8 @@ class NeuronVLLMHttpServer(vLLMHttpServer):
         )
         if unsupported:
             raise ValueError(f"Native Neuron sampling does not support {', '.join(unsupported)}")
+        if getattr(self, "_speculative_decoding", False):
+            check_speculative_sampling(sampling_params)
 
     def _postprocess_output(self, output, final_res, sampling_params):
         self._validate_output(output, sampling_params.logprobs is not None)

@@ -264,7 +264,8 @@ controls the bucket size. Remove
 `weight_sync_cpu_gather_threshold_bytes` from existing job overrides.
 
 We use CPU sampling because vLLM-Neuron's current on-device sampler limits
-sampling to at most 256 candidates, even with `top_k: -1`.
+sampling to at most 256 candidates, even with `top_k: -1`. Speculative
+decoding is the exception; see below.
 
 For a TP8/FSDP8 actor placed on all 64 logical NeuronCores of a Trainium2
 node, set `VERL_NEURON_ACTOR_CORE_ORDER=tp8_fsdp8` in every actor worker's
@@ -273,6 +274,52 @@ ranks checks its actual Ray node IDs and exclusive core leases. A 64-rank
 group split across nodes or sharing those cores cannot enable this mapping.
 Leave the variable unset for the example above and other partial-node allocations; each
 worker then keeps the core assigned by Ray.
+
+### Speculative decoding (experimental)
+
+Dense Qwen3 rollout can use a DFlash or EAGLE-3 draft model (`method: dflash`
+or `method: eagle3`). Pass vLLM's speculative configuration through the
+rollout engine arguments:
+
+```yaml
+actor_rollout_ref:
+  rollout:
+    calculate_log_probs: false
+    top_k: 256
+    engine_kwargs:
+      vllm:
+        speculative_config:
+          method: dflash
+          model: /path/to/draft
+          num_speculative_tokens: 15
+```
+
+The plugin then switches this rollout to vLLM-Neuron's on-device sampler and
+rejection sampler, because the CPU sampler cannot verify draft tokens. This
+differs from the default rollout in two ways:
+
+- **At most 256 candidates.** The on-device sampler keeps at most 256
+  candidates per token. Set `top_k` between 1 and 256 for sampled requests
+  (training and, when `val_kwargs.do_sample` is true, validation). The
+  plugin rejects `top_k: -1` instead of capping it silently. Greedy requests
+  (temperature 0) are unaffected.
+- **No rollout log-probabilities.** The rejection sampler returns token ids
+  only. Keep `calculate_log_probs: false`; the actor computes the GRPO log
+  probabilities. Requests that ask for log-probabilities fail.
+
+Speculative decoding does not otherwise change the sampling distribution. At
+each draft position the rejection sampler samples a token from the target
+distribution and accepts the draft token only if the two match, so every
+emitted token is a target sample; the draft only sets how many positions one
+step advances.
+
+Set `method` explicitly. The plugin fails at startup for other speculative
+methods, for the Qwen3.8 rollout, and for verl's MTP rollout. vLLM-Neuron also
+limits DFlash to
+`max_num_seqs * (num_speculative_tokens + 1) <= 256`. Qwen3 with
+`num_speculative_tokens: 15` needs a vLLM-Neuron build whose NKI argmax falls
+back to `torch.max` above 16384 elements per partition, and `top_p < 1` needs
+its top-p fix that keeps the threshold-crossing token.
 
 ### Launch and inspect the run
 

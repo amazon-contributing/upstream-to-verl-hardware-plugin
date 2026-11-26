@@ -278,3 +278,47 @@ def test_cpu_sampling_scores_the_selected_token_and_preserves_batch(
         else:
             assert str(restored.device) == device
     torch.testing.assert_close(logits, original_logits)
+
+
+@pytest.mark.parametrize(
+    "on_device,max_num_logprobs,error",
+    [(True, None, None), (True, 0, ValueError), (False, None, NotImplementedError)],
+)
+def test_speculative_steps_use_the_device_rejection_sampler(on_device, max_num_logprobs, error):
+    calls = []
+    sampling = SimpleNamespace(all_greedy=False, deterministic=False, max_top_k=256) if on_device else None
+    runner = SimpleNamespace(
+        neuron_config=SimpleNamespace(enable_structured_outputs=True, on_device_sampling_config=sampling),
+        sampler=SimpleNamespace(
+            logprobs_mode="processed_logprobs", use_fp64_gumbel=False, topk_topp_sampler=SimpleNamespace()
+        ),
+        use_async_scheduling=False,
+        on_device_sampling=on_device,
+        vocab_size=8,
+        lm_head_tp_rank=0,
+        _lm_head_vocab_shard_size=lambda: 8,
+        _use_lm_head_sharded_logit_mask=lambda: False,
+        _build_noop_logit_mask=lambda num_logit_rows, device, compiled_graph_input=False: torch.ones(
+            num_logit_rows, 8, dtype=torch.bool, device=device
+        ),
+        _get_grammar_bitmask=lambda scheduler_output: None,
+        _sample=lambda model_output_tensor, spec_decode_metadata=None: calls.append(spec_decode_metadata) or "accepted",
+        input_batch=SimpleNamespace(
+            sampling_metadata=SimpleNamespace(
+                max_num_logprobs=max_num_logprobs,
+                no_penalties=True,
+                bad_words_token_ids={},
+                allowed_token_ids_mask=None,
+                logitsprocs=SimpleNamespace(argmax_invariant=[], non_argmax_invariant=[]),
+            )
+        ),
+    )
+    NeuronWorkerExtension.monkey_patch_model(SimpleNamespace(model_runner=runner), 7)
+    spec_decode_metadata = object()
+    if error is None:
+        assert runner._sample(torch.zeros(2, 16), spec_decode_metadata) == "accepted"
+        assert calls == [spec_decode_metadata]
+    else:
+        with pytest.raises(error, match="speculative decoding"):
+            runner._sample(torch.zeros(2, 16), spec_decode_metadata)
+        assert calls == []

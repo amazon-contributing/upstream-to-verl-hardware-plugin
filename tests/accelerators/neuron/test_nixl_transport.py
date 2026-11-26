@@ -315,3 +315,44 @@ def test_nixl_fanout_assigns_every_receiver_once(checkpoint_engine, monkeypatch,
     assert sorted(ownership) == [(replica, rank) for replica in range(replicas) for rank in range(rollout_tp)]
     assert max(loads) - min(loads) <= 1
     assert stores == [True, *([False] * (world_size - 1))]
+
+
+def test_master_store_keeps_the_port_it_binds(checkpoint_engine, monkeypatch):
+    """Rank 0 binds the control store once at port 0 and reuses it, instead of probing and rebinding a port."""
+    import sys
+
+    created = []
+
+    def control_store(spec, *, master):
+        created.append((spec.store_port, master))
+        return SimpleNamespace(port=43210)
+
+    monkeypatch.setattr(checkpoint_engine, "control_store", control_store)
+    monkeypatch.setitem(
+        sys.modules, "ray", SimpleNamespace(util=SimpleNamespace(get_node_ip_address=lambda: "10.0.0.1"))
+    )
+    monkeypatch.setattr(
+        checkpoint_engine, "NixlEndpoint", lambda *args, **kwargs: SimpleNamespace(store=Mock(get=lambda key: b"{}"))
+    )
+    instance = SimpleNamespace(
+        rank=0,
+        world_size=1,
+        schedule=[],
+        bucket_size=8,
+        verify_weights=False,
+        timeout_s=30,
+        connected=False,
+        endpoints={},
+        plans={},
+        layout=SimpleNamespace(buckets=[]),
+        device="neuron",
+        core=0,
+    )
+    for _ in range(2):
+        metadata = checkpoint_engine.NeuronNixlCheckpointEngine.prepare(instance)
+        assert (metadata["host"], metadata["port"]) == ("10.0.0.1", 43210)
+    checkpoint_engine.NeuronNixlCheckpointEngine.init_process_group(
+        instance, SimpleNamespace(replicas=1, rollout_tp=1, timeout_s=30)
+    )
+    assert created == [(0, True)]
+    assert instance.store is instance.master_store

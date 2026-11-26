@@ -6,7 +6,6 @@
 import json
 import logging
 import os
-import socket
 import time
 from datetime import timedelta
 from functools import lru_cache
@@ -83,11 +82,15 @@ class NeuronNixlCheckpointEngine(CheckpointEngine):
 
         metadata = {"role": "actor", "schedule": self.schedule, "bucket_size": self.bucket_size}
         if self.rank == 0:
-            if not hasattr(self, "port"):
-                with socket.socket() as listener:
-                    listener.bind(("127.0.0.1", 0))
-                    self.port = listener.getsockname()[1]
-            metadata.update(host=ray.util.get_node_ip_address(), port=self.port, timeout_s=self.timeout_s)
+            host = ray.util.get_node_ip_address()
+            if getattr(self, "master_store", None) is None:
+                # Bind port 0 and keep the listening store. Probing a free port, closing it and binding it
+                # again in init_process_group races with other processes on the host (EADDRINUSE).
+                self.master_store = control_store(
+                    NixlTopology(host, 0, rollout_tp=1, replicas=1, timeout_s=self.timeout_s), master=True
+                )
+                self.port = self.master_store.port
+            metadata.update(host=host, port=self.port, timeout_s=self.timeout_s)
         return metadata
 
     @classmethod
@@ -125,7 +128,8 @@ class NeuronNixlCheckpointEngine(CheckpointEngine):
                 raise ValueError("NIXL topology cannot change during this run")
             return
         self.spec = spec
-        self.store = control_store(spec, master=self.rank == 0)
+        store = getattr(self, "master_store", None) if self.rank == 0 else None
+        self.store = store if store is not None else control_store(spec, master=self.rank == 0)
         shapes = {name: shape for name, shape, dtype in self.schedule}
         for replica in range(spec.replicas):
             for rank in range(spec.rollout_tp):
